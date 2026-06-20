@@ -1,0 +1,2 @@
+"""Light Academia application package."""
+

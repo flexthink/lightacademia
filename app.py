@@ -1,0 +1,673 @@
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+import streamlit as st
+
+from lightacademia.actions import NoteAction, build_action_prompt, parse_note_actions
+from lightacademia.agents import AgentContext, AgentError, AgentProgress, ProgressCallback, default_agent
+from lightacademia.chat import append_chat_entry
+from lightacademia.git_ops import GitError, git_commit_all, git_status_lines
+from lightacademia.markdown_preview import (
+    ProjectImageError,
+    find_standalone_images,
+    resolve_project_image,
+)
+from lightacademia.storage import (
+    HOME_NOTE,
+    Project,
+    archive_note,
+    archive_project,
+    create_note,
+    create_project,
+    ensure_project_directories,
+    ensure_tools_dir,
+    list_notes,
+    list_projects,
+    read_note,
+    rename_note,
+    save_note,
+)
+
+try:
+    from code_editor import code_editor
+except Exception:  # pragma: no cover - optional Streamlit component
+    code_editor = None
+
+
+DEFAULT_NOTEBOOK_DIR = Path("notebook")
+DEFAULT_TOOLS_DIR = Path("tools")
+DEFAULT_AUTOCOMMIT_SECONDS = 5 * 60
+PREVIEW_DEBOUNCE_SECONDS = 0.65
+ICON_BUTTON_LABEL = " "
+LOGO_PATH = Path("assets/logo.png")
+THEME_CSS_PATH = Path("assets/theme.css")
+
+
+def apply_theme() -> None:
+    if THEME_CSS_PATH.exists():
+        css = THEME_CSS_PATH.read_text(encoding="utf-8")
+        st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+
+@lru_cache(maxsize=1)
+def logo_data_uri() -> str | None:
+    if not LOGO_PATH.exists():
+        return None
+    encoded = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def render_app_header() -> None:
+    logo_uri = logo_data_uri()
+    logo_html = (
+        f'<img class="la-logo" src="{logo_uri}" alt="Light Academia logo">'
+        if logo_uri
+        else '<span class="la-logo-fallback">✨🎻📚</span>'
+    )
+    st.markdown(
+        f"""
+        <header class="la-app-header">
+            {logo_html}
+            <div class="la-wordmark" aria-label="Light Academia">
+                <span>Light</span>
+                <span>Academia</span>
+            </div>
+        </header>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    notebook_dir: Path
+    tools_dir: Path
+    autocommit_seconds: int
+
+
+@lru_cache(maxsize=1)
+def get_config() -> AppConfig:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--notebook", type=Path, default=DEFAULT_NOTEBOOK_DIR)
+    parser.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
+    parser.add_argument("--autocommit-seconds", type=int, default=DEFAULT_AUTOCOMMIT_SECONDS)
+    args, _ = parser.parse_known_args()
+    return AppConfig(
+        notebook_dir=args.notebook.expanduser(),
+        tools_dir=args.tools.expanduser(),
+        autocommit_seconds=max(30, args.autocommit_seconds),
+    )
+
+
+@st.dialog("New project", icon=":material/create_new_folder:")
+def new_project_dialog(notebook_dir: Path) -> None:
+    title = st.text_input("Project name", key="new_project_title")
+    if st.button("Create", type="primary", icon=":material/add:"):
+        if not title.strip():
+            st.warning("Enter a project name.")
+            return
+        try:
+            project = create_project(notebook_dir, title)
+            st.session_state.project_name = project.name
+            st.session_state.note_name = HOME_NOTE
+            st.session_state.editor_revision += 1
+            st.rerun()
+        except (OSError, GitError) as exc:
+            st.error(f"Could not create project: {exc}")
+
+
+@st.dialog("Archive project", icon=":material/archive:")
+def archive_project_dialog(notebook_dir: Path, project: Project, current_note_to_save=None) -> None:
+    st.write(f"Archive `{project.name}`?")
+    if st.button("Archive", type="primary", icon=":material/archive:"):
+        try:
+            if current_note_to_save is not None:
+                save_editor_state(current_note_to_save)
+            archive_project(notebook_dir, project)
+            st.session_state.project_name = None
+            st.session_state.note_name = None
+            st.session_state.editor_revision += 1
+            st.rerun()
+        except (OSError, GitError) as exc:
+            st.error(f"Could not archive project: {exc}")
+
+
+@st.dialog("New note", icon=":material/note_add:")
+def new_note_dialog(project: Project) -> None:
+    title = st.text_input("Note title", key="new_note_title")
+    if st.button("Create", type="primary", icon=":material/add:"):
+        if not title.strip():
+            st.warning("Enter a note title.")
+            return
+        note = create_note(project, title)
+        st.session_state.note_name = note.name
+        st.session_state.editor_revision += 1
+        st.rerun()
+
+
+@st.dialog("Rename note", icon=":material/edit:")
+def rename_note_dialog(project: Project, note) -> None:
+    new_title = st.text_input("New title", value=note.path.stem, key=f"rename_{note.name}")
+    if st.button("Rename", type="primary", icon=":material/drive_file_rename_outline:"):
+        if not new_title.strip():
+            st.warning("Enter a note title.")
+            return
+        try:
+            save_editor_state(note)
+            renamed = rename_note(project, note, new_title)
+            st.session_state.note_name = renamed.name
+            st.session_state.editor_revision += 1
+            st.rerun()
+        except (OSError, GitError) as exc:
+            st.error(f"Could not rename note: {exc}")
+
+
+@st.dialog("Archive note", icon=":material/archive:")
+def archive_note_dialog(project: Project, note) -> None:
+    st.write(f"Archive `{note.name}`?")
+    if st.button("Archive", type="primary", icon=":material/archive:"):
+        try:
+            save_editor_state(note)
+            archive_note(project, note)
+            st.session_state.note_name = HOME_NOTE
+            st.session_state.editor_revision += 1
+            st.rerun()
+        except (OSError, GitError) as exc:
+            st.error(f"Could not archive note: {exc}")
+
+
+def init_state() -> None:
+    defaults = {
+        "project_name": None,
+        "note_name": None,
+        "last_saved_note_key": None,
+        "last_edit_at": None,
+        "last_commit_at": None,
+        "editor_revision": 0,
+        "preview_note_key": None,
+        "preview_content": "",
+        "preview_pending_content": "",
+        "preview_pending_at": None,
+        "preview_source_key": None,
+        "preview_source_content": "",
+        "preview_source_project_dir": None,
+        "last_agent_response": None,
+        "last_agent_error": None,
+        "agent_running": False,
+        "requested_action": None,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def current_project(projects: list[Project]) -> Project | None:
+    if not projects:
+        return None
+    names = [project.name for project in projects]
+    if st.session_state.project_name not in names:
+        st.session_state.project_name = names[0]
+    return projects[names.index(st.session_state.project_name)]
+
+
+def current_note(notes):
+    if not notes:
+        return None
+    names = [note.name for note in notes]
+    if st.session_state.note_name not in names:
+        st.session_state.note_name = HOME_NOTE if HOME_NOTE in names else names[0]
+    return notes[names.index(st.session_state.note_name)]
+
+
+def commit_if_idle(project: Project, autocommit_seconds: int) -> None:
+    last_edit_at = st.session_state.get("last_edit_at")
+    last_commit_at = st.session_state.get("last_commit_at")
+    if not last_edit_at:
+        return
+    if last_commit_at and last_commit_at >= last_edit_at:
+        return
+    if time.time() - last_edit_at < autocommit_seconds:
+        return
+    if git_commit_all(project.path, "Autosave checkpoint"):
+        st.session_state.last_commit_at = time.time()
+        st.toast("Autosave checkpoint committed")
+
+
+def editor_key(note) -> str:
+    return f"editor_{note.name}_{st.session_state.editor_revision}"
+
+
+def save_editor_state(note) -> bool:
+    if st.session_state.get("agent_running"):
+        return False
+    value = st.session_state.get(editor_key(note))
+    if isinstance(value, dict):
+        value = value.get("text")
+    if not isinstance(value, str):
+        return False
+    if value == read_note(note):
+        return False
+    save_note(note, value)
+    st.session_state.last_edit_at = time.time()
+    return True
+
+
+def editor_response_content(response, fallback: str) -> str:
+    if not isinstance(response, dict):
+        return fallback
+    response_text = response.get("text")
+    response_type = response.get("type")
+    if response_type == "" and response_text == "":
+        return fallback
+    return response_text if isinstance(response_text, str) else fallback
+
+
+def commit_before_navigation(
+    project: Project,
+    current_note_to_save=None,
+    next_project: str | None = None,
+    next_note: str | None = None,
+) -> None:
+    if current_note_to_save is not None:
+        save_editor_state(current_note_to_save)
+    if git_commit_all(project.path, "Checkpoint before navigation"):
+        st.session_state.last_commit_at = time.time()
+    if next_project is not None:
+        st.session_state.project_name = next_project
+    if next_note is not None:
+        st.session_state.note_name = next_note
+    st.session_state.editor_revision += 1
+    st.rerun()
+
+
+def render_editor(note) -> str:
+    content = read_note(note)
+    key = editor_key(note)
+    if code_editor is not None:
+        response = code_editor(
+            content,
+            lang="markdown",
+            height=[28, 36],
+            key=key,
+            response_mode=["debounce", "blur"],
+            options={"wrap": True, "fontSize": 14},
+        )
+        return editor_response_content(response, content)
+    return st.text_area("Markdown", value=content, height=620, key=key, label_visibility="collapsed")
+
+
+def preview_key(note) -> str:
+    return f"{note.path}:{st.session_state.editor_revision}"
+
+
+def debounced_preview_content(key: str, content: str) -> str:
+    now = time.time()
+    if st.session_state.preview_note_key != key:
+        st.session_state.preview_note_key = key
+        st.session_state.preview_content = content
+        st.session_state.preview_pending_content = content
+        st.session_state.preview_pending_at = now
+        return content
+
+    if content != st.session_state.preview_pending_content:
+        st.session_state.preview_pending_content = content
+        st.session_state.preview_pending_at = now
+
+    pending_at = st.session_state.preview_pending_at
+    if pending_at is None or now - pending_at >= PREVIEW_DEBOUNCE_SECONDS:
+        st.session_state.preview_content = st.session_state.preview_pending_content
+    elif st.session_state.preview_content == "":
+        st.session_state.preview_content = st.session_state.preview_pending_content
+
+    return st.session_state.preview_content
+
+
+@st.fragment(run_every="700ms")
+def render_preview_fragment() -> None:
+    source_key = st.session_state.get("preview_source_key")
+    source_content = st.session_state.get("preview_source_content", "")
+    source_project_dir = st.session_state.get("preview_source_project_dir")
+    if not source_key or not source_project_dir:
+        return
+    preview_content = debounced_preview_content(source_key, source_content)
+    with st.container(key="preview_pane", height=620):
+        render_project_markdown(preview_content, Path(source_project_dir), source_key)
+
+
+def render_project_markdown(markdown: str, project_dir: Path, source_key: str) -> None:
+    lines = markdown.splitlines(keepends=True)
+    cursor = 0
+    rendered = False
+    events = [
+        (action.line - 1, action.line - 1, "action", action)
+        for action in parse_note_actions(markdown).actions
+    ]
+    events.extend(
+        (image.start_line, image.end_line, "image", image)
+        for image in find_standalone_images(markdown)
+    )
+    events.sort(key=lambda event: (event[0], event[2]))
+
+    for start_line, end_line, event_type, event in events:
+        preceding_markdown = "".join(lines[cursor:start_line])
+        if preceding_markdown.strip():
+            st.markdown(preceding_markdown)
+            rendered = True
+
+        if event_type == "action":
+            action_key = hashlib.sha256(
+                f"{source_key}:{event.line}:{event.name}".encode("utf-8")
+            ).hexdigest()[:16]
+            if st.button(
+                f"Run: {event.name}",
+                key=f"preview_action_{action_key}",
+                icon=":material/bolt:",
+                help="Select this action",
+            ):
+                st.session_state.requested_action = event
+                st.rerun()
+        else:
+            try:
+                image_path = resolve_project_image(project_dir, event.target)
+            except ProjectImageError as exc:
+                st.warning(str(exc))
+            else:
+                st.image(image_path, caption=event.alt or None, width="stretch")
+        rendered = True
+        cursor = end_line
+
+    remaining_markdown = "".join(lines[cursor:])
+    if remaining_markdown.strip():
+        st.markdown(remaining_markdown)
+        rendered = True
+    if not rendered:
+        st.markdown(" ")
+
+
+def render_preview(project: Project, note, content: str) -> None:
+    st.session_state.preview_source_key = preview_key(note)
+    st.session_state.preview_source_content = content
+    st.session_state.preview_source_project_dir = str(project.path)
+    render_preview_fragment()
+
+
+def reload_note_from_disk() -> None:
+    st.session_state.editor_revision += 1
+    st.session_state.requested_action = None
+    st.session_state.preview_note_key = None
+    st.session_state.preview_content = ""
+    st.session_state.preview_pending_content = ""
+    st.session_state.preview_pending_at = None
+    st.session_state.preview_source_key = None
+    st.session_state.preview_source_content = ""
+    st.session_state.preview_source_project_dir = None
+
+
+def action_option_label(action: NoteAction | None) -> str:
+    return "Choose an action..." if action is None else action.name
+
+
+def action_selector_key(note) -> str:
+    return f"selected_action_{note.name}_{st.session_state.editor_revision}"
+
+
+def apply_requested_action(note, actions: tuple[NoteAction, ...]) -> None:
+    requested_action = st.session_state.get("requested_action")
+    if requested_action is None:
+        return
+    selected_action = next((action for action in actions if action == requested_action), None)
+    if selected_action is not None:
+        st.session_state[action_selector_key(note)] = selected_action
+    st.session_state.requested_action = None
+
+
+def run_agent_command(
+    project: Project,
+    note,
+    prompt: str,
+    tools_dir: Path,
+    on_progress: ProgressCallback | None = None,
+) -> str:
+    save_editor_state(note)
+    git_commit_all(project.path, "Checkpoint before agent command")
+    st.session_state.last_commit_at = time.time()
+
+    agent = default_agent()
+    context = AgentContext(
+        project_dir=project.path,
+        project_name=project.name,
+        tools_dir=tools_dir,
+        current_note=note.name if note is not None else None,
+    )
+    before_status = set(git_status_lines(project.path))
+    st.session_state.agent_running = True
+    try:
+        result = agent.run(prompt, context, on_progress=on_progress)
+    finally:
+        st.session_state.agent_running = False
+    after_status = git_status_lines(project.path)
+    changed_lines = [line for line in after_status if line not in before_status] or after_status
+
+    log_path = append_chat_entry(
+        project.path,
+        prompt,
+        result.response,
+        agent_name=agent.name,
+        tool_actions=result.tool_actions,
+        file_changes=changed_lines,
+    )
+    git_commit_all(project.path, "[agent] Run agent command")
+    st.session_state.last_commit_at = time.time()
+    reload_note_from_disk()
+    return f"{result.response}\n\nLogged to `{log_path.relative_to(project.path)}`."
+
+
+def main() -> None:
+    st.set_page_config(page_title="Light Academia", page_icon="📚", layout="wide")
+    if not hasattr(st, "bottom"):
+        st.error(
+            f"Light Academia requires Streamlit 1.57 or newer; found {st.__version__}. "
+            "Install the dependencies from requirements.txt and restart the app."
+        )
+        return
+    init_state()
+    config = get_config()
+    apply_theme()
+    render_app_header()
+
+    notebook_dir = config.notebook_dir
+    tools_dir = config.tools_dir
+
+    try:
+        ensure_tools_dir(tools_dir)
+        projects = list_projects(notebook_dir)
+    except OSError as exc:
+        st.error(f"Could not open workspace folders: {exc}")
+        return
+
+    with st.sidebar:
+        if st.button(
+            ICON_BUTTON_LABEL,
+            key="open_new_project",
+            help="New project",
+            icon=":material/create_new_folder:",
+        ):
+            new_project_dialog(notebook_dir)
+
+    project = current_project(projects)
+    if project is None:
+        st.info("Create a project to get started.")
+        return
+    try:
+        ensure_project_directories(project)
+    except OSError as exc:
+        st.error(f"Could not prepare project folders: {exc}")
+        return
+
+    try:
+        commit_if_idle(project, config.autocommit_seconds)
+    except GitError as exc:
+        st.warning(f"Autosave commit failed: {exc}")
+
+    note_before_project_navigation = current_note(list_notes(project))
+
+    with st.sidebar:
+        project_names = [item.name for item in projects]
+        project_header, project_archive = st.columns([0.78, 0.22], vertical_alignment="center")
+        with project_header:
+            selected_project = st.selectbox(
+                "Projects",
+                project_names,
+                index=project_names.index(project.name),
+            )
+        with project_archive:
+            st.write("")
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_archive_project",
+                help="Archive project",
+                icon=":material/archive:",
+            ):
+                archive_project_dialog(notebook_dir, project, note_before_project_navigation)
+        if selected_project != project.name:
+            commit_before_navigation(
+                project,
+                current_note_to_save=note_before_project_navigation,
+                next_project=selected_project,
+                next_note=None,
+            )
+
+        st.divider()
+        if st.button(
+            ICON_BUTTON_LABEL,
+            key="open_new_note",
+            help="New note",
+            icon=":material/note_add:",
+        ):
+            new_note_dialog(project)
+
+    notes = list_notes(project)
+    note = current_note(notes)
+    if note is None:
+        st.info("Create a note to get started.")
+        return
+
+    with st.sidebar:
+        note_names = [item.name for item in notes]
+        selected_note = st.radio(
+            "Notes",
+            note_names,
+            index=note_names.index(note.name),
+        )
+        if selected_note != note.name:
+            commit_before_navigation(project, current_note_to_save=note, next_note=selected_note)
+
+    header_col, action_col = st.columns([0.84, 0.16], vertical_alignment="center")
+    with header_col:
+        st.markdown(f'<h2 class="la-note-title">{note.name}</h2>', unsafe_allow_html=True)
+    with action_col:
+        rename_col, archive_col = st.columns(2)
+        with rename_col:
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_rename_note",
+                help="Rename note",
+                icon=":material/drive_file_rename_outline:",
+            ):
+                rename_note_dialog(project, note)
+        with archive_col:
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_archive_note",
+                help="Archive note",
+                icon=":material/archive:",
+                disabled=note.name == HOME_NOTE,
+            ):
+                archive_note_dialog(project, note)
+
+    editor_col, preview_col = st.columns([0.52, 0.48], gap="medium")
+    with editor_col:
+        edited_content = render_editor(note)
+    original_content = read_note(note)
+    if not st.session_state.get("agent_running") and edited_content != original_content:
+        save_note(note, edited_content)
+        st.session_state.last_edit_at = time.time()
+    with preview_col:
+        render_preview(project, note, edited_content)
+
+    action_result = parse_note_actions(edited_content)
+    apply_requested_action(note, action_result.actions)
+    for error in action_result.errors:
+        st.warning(f"Action block at line {error.line}: {error.message}")
+
+    if st.session_state.last_agent_error:
+        st.error(st.session_state.last_agent_error)
+    if st.session_state.last_agent_response:
+        st.markdown(st.session_state.last_agent_response)
+
+    with st.bottom:
+        st.caption("Agent chat")
+        with st.form("agent_chat", clear_on_submit=True):
+            action_input, prompt_input = st.columns([0.34, 0.66], vertical_alignment="top")
+            with action_input:
+                selected_action = st.selectbox(
+                    "Action",
+                    [None, *action_result.actions],
+                    format_func=action_option_label,
+                    key=action_selector_key(note),
+                    label_visibility="collapsed",
+                )
+            with prompt_input:
+                prompt = st.text_area("Message", height=120, label_visibility="collapsed")
+            submitted = st.form_submit_button("Run agent")
+        if submitted and (prompt.strip() or selected_action is not None):
+            agent_prompt = (
+                build_action_prompt(selected_action, note.name, prompt)
+                if selected_action is not None
+                else prompt.strip()
+            )
+            progress_entries: list[str] = []
+            progress_chars = 0
+            with st.status("Codex is working...", expanded=True) as progress_status:
+                progress_scroller = st.container(
+                    height=220,
+                    border=False,
+                    key="agent_progress_feed",
+                    autoscroll=True,
+                )
+                progress_output = progress_scroller.empty()
+
+                def show_agent_progress(progress: AgentProgress) -> None:
+                    nonlocal progress_chars
+                    entry = f"[{progress.event_type}]\n{progress.text}"
+                    progress_entries.append(entry)
+                    progress_chars += len(entry)
+                    while progress_chars > 100_000 and len(progress_entries) > 1:
+                        progress_chars -= len(progress_entries.pop(0))
+                    progress_output.code("\n\n".join(progress_entries), language=None)
+
+                try:
+                    st.session_state.last_agent_response = run_agent_command(
+                        project,
+                        note,
+                        agent_prompt,
+                        tools_dir,
+                        on_progress=show_agent_progress,
+                    )
+                    st.session_state.last_agent_error = None
+                    progress_status.update(label="Codex finished", state="complete")
+                except (OSError, GitError, AgentError) as exc:
+                    progress_status.update(label="Codex failed", state="error")
+                    st.session_state.last_agent_error = f"Could not run agent: {exc}"
+                    reload_note_from_disk()
+            st.rerun()
+
+
+if __name__ == "__main__":
+    main()

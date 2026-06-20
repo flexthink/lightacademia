@@ -1,0 +1,20 @@
+[theme]
+base = "light"
+primaryColor = "#8f3f35"
+backgroundColor = "#f8f4eb"
+secondaryBackgroundColor = "#eee7d7"
+textColor = "#2e2923"
+linkColor = "#7a5a24"
+borderColor = "#d8ccb6"
+showWidgetBorder = true
+baseRadius = "0.4rem"
+buttonRadius = "0.35rem"
+font = "serif"
+codeFont = "monospace"
+headingFont = "serif"
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+fileWatcherType = "poll"
