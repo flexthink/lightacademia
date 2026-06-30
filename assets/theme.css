@@ -132,20 +132,33 @@ h3 {
     display: flex;
     align-items: center;
     gap: 0.45rem;
-    min-width: 0;
-    padding-bottom: 0.25rem;
+    padding-bottom: 0;
 }
 
 .la-current-note {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    overflow: visible;
+    text-overflow: clip;
     white-space: nowrap;
     color: var(--la-ink);
     font-family: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
     font-size: 1.55rem;
     font-weight: 700;
     line-height: 1;
+}
+
+.st-key-open_rename_note button {
+    min-height: 2rem;
+    width: 2rem;
+    padding: 0.25rem;
+    transform: translateY(0.22rem);
+}
+
+.st-key-open_rename_note button [data-testid="stIconMaterial"] {
+    font-size: 1.1rem;
+}
+
+.st-key-note_title_action [data-testid="stMarkdownContainer"] p {
+    margin: 0;
 }
 
 .la-note-title {

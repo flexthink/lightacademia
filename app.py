@@ -910,22 +910,27 @@ def main() -> None:
         if selected_note != note.name:
             commit_before_navigation(project, current_note_to_save=note, next_note=selected_note)
 
-    brand_col, note_title_col, rename_col, spacer_col, view_col, archive_col = st.columns(
-        [0.32, 0.18, 0.06, 0.28, 0.08, 0.08],
+    brand_col, title_group_col, spacer_col, view_col, archive_col = st.columns(
+        [0.32, 0.36, 0.16, 0.08, 0.08],
         vertical_alignment="center",
     )
     with brand_col:
         render_app_header()
-    with note_title_col:
-        render_note_header_title(note.name)
-    with rename_col:
-        if st.button(
-            ICON_BUTTON_LABEL,
-            key="open_rename_note",
-            help="Rename note",
-            icon=":material/drive_file_rename_outline:",
+    with title_group_col:
+        with st.container(
+            key="note_title_action",
+            horizontal=True,
+            vertical_alignment="center",
+            gap="small",
         ):
-            rename_note_dialog(project, note)
+            render_note_header_title(note.name)
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_rename_note",
+                help="Rename note",
+                icon=":material/drive_file_rename_outline:",
+            ):
+                rename_note_dialog(project, note)
     with spacer_col:
         st.write("")
     with view_col:
