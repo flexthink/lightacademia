@@ -31,7 +31,14 @@ from lightacademia.agents import (
     default_agent,
 )
 from lightacademia.chat import append_chat_entry
-from lightacademia.git_ops import GitError, git_commit_all, git_status_lines
+from lightacademia.git_ops import (
+    GitError,
+    GitFileRevision,
+    git_commit_all,
+    git_file_at_revision,
+    git_file_history,
+    git_status_lines,
+)
 from lightacademia.markdown_preview import (
     ProjectImageError,
     find_standalone_images,
@@ -150,6 +157,12 @@ def logo_data_uri() -> str | None:
 
 def note_display_name(note_name: str) -> str:
     return Path(note_name).stem if note_name.endswith(".md") else note_name
+
+
+def history_entry_label(revision: GitFileRevision) -> str:
+    when = revision.committed_at.strftime("%Y-%m-%d %H:%M")
+    short_commit = revision.commit[:7]
+    return f"{when} · {short_commit} · {revision.subject}"
 
 
 def render_app_header(note_name: str | None = None) -> None:
@@ -316,6 +329,36 @@ def archive_note_dialog(project: Project, note) -> None:
             st.error(f"Could not archive note: {exc}")
 
 
+@st.dialog("Note history", icon=":material/history:")
+def note_history_dialog(project: Project, note) -> None:
+    save_editor_state(note)
+    try:
+        revisions = git_file_history(project.path, note.path)
+    except GitError as exc:
+        st.error(f"Could not read note history: {exc}")
+        return
+
+    if not revisions:
+        st.info("No history for this note yet.")
+        return
+
+    for revision in revisions:
+        label_col, button_col = st.columns([0.78, 0.22], vertical_alignment="center")
+        with label_col:
+            st.markdown(history_entry_label(revision))
+        with button_col:
+            if st.button(
+                "View",
+                key=f"view_history_{note.name}_{revision.commit}",
+                icon=":material/visibility:",
+            ):
+                st.session_state.history_revision = revision.commit
+                st.session_state.history_note_name = note.name
+                st.session_state.history_label = history_entry_label(revision)
+                st.session_state.source_visible = False
+                st.rerun()
+
+
 def init_state() -> None:
     defaults = {
         "project_name": None,
@@ -339,6 +382,9 @@ def init_state() -> None:
         "agent_progress_chars": 0,
         "requested_action": None,
         "source_visible": False,
+        "history_revision": None,
+        "history_note_name": None,
+        "history_label": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -387,6 +433,20 @@ def sync_selection_to_query(project: Project, note_name: str | None) -> None:
     set_selection_query(project.name, note_name)
 
 
+def active_history_revision(note) -> str | None:
+    revision = st.session_state.get("history_revision")
+    note_name = st.session_state.get("history_note_name")
+    if isinstance(revision, str) and note_name == note.name:
+        return revision
+    return None
+
+
+def clear_history_revision() -> None:
+    st.session_state.history_revision = None
+    st.session_state.history_note_name = None
+    st.session_state.history_label = None
+
+
 def current_project(projects: list[Project]) -> Project | None:
     if not projects:
         return None
@@ -430,6 +490,8 @@ def note_pane_height() -> int:
 def save_editor_state(note) -> bool:
     if st.session_state.get("agent_running"):
         return False
+    if active_history_revision(note) is not None:
+        return False
     value = st.session_state.get(editor_key(note))
     if isinstance(value, dict):
         value = value.get("text")
@@ -466,6 +528,7 @@ def commit_before_navigation(
         st.session_state.project_name = next_project
     if next_note is not None:
         st.session_state.note_name = next_note
+    clear_history_revision()
     set_selection_query(
         next_project or project.name,
         next_note if next_note is not None else (None if next_project is not None else st.session_state.note_name),
@@ -523,14 +586,15 @@ def render_preview_fragment() -> None:
     source_key = st.session_state.get("preview_source_key")
     source_content = st.session_state.get("preview_source_content", "")
     source_project_dir = st.session_state.get("preview_source_project_dir")
+    allow_actions = bool(st.session_state.get("preview_allow_actions", True))
     if not source_key or not source_project_dir:
         return
     preview_content = debounced_preview_content(source_key, source_content)
     with st.container(key="preview_pane"):
-        render_project_markdown(preview_content, Path(source_project_dir), source_key)
+        render_project_markdown(preview_content, Path(source_project_dir), source_key, allow_actions=allow_actions)
 
 
-def render_project_markdown(markdown: str, project_dir: Path, source_key: str) -> None:
+def render_project_markdown(markdown: str, project_dir: Path, source_key: str, allow_actions: bool = True) -> None:
     rendered_markdown, note_link_errors = rewrite_project_note_links(markdown, project_dir)
     for error in note_link_errors:
         st.warning(error)
@@ -538,10 +602,12 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str) -
     lines = rendered_markdown.splitlines(keepends=True)
     cursor = 0
     rendered = False
-    events = [
-        (action.line - 1, action.line - 1, "action", action)
-        for action in parse_note_actions(markdown).actions
-    ]
+    events = []
+    if allow_actions:
+        events.extend(
+            (action.line - 1, action.line - 1, "action", action)
+            for action in parse_note_actions(markdown).actions
+        )
     events.extend(
         (image.start_line, image.end_line, "image", image)
         for image in find_standalone_images(markdown)
@@ -584,16 +650,18 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str) -
         st.markdown(" ")
 
 
-def render_preview(project: Project, note, content: str) -> None:
-    st.session_state.preview_source_key = preview_key(note)
+def render_preview(project: Project, note, content: str, allow_actions: bool = True, source_suffix: str = "") -> None:
+    st.session_state.preview_source_key = f"{preview_key(note)}{source_suffix}"
     st.session_state.preview_source_content = content
     st.session_state.preview_source_project_dir = str(project.path)
+    st.session_state.preview_allow_actions = allow_actions
     render_preview_fragment()
 
 
 def reload_note_from_disk() -> None:
     st.session_state.editor_revision += 1
     st.session_state.requested_action = None
+    clear_history_revision()
     st.session_state.preview_note_key = None
     st.session_state.preview_content = ""
     st.session_state.preview_pending_content = ""
@@ -910,8 +978,11 @@ def main() -> None:
         if selected_note != note.name:
             commit_before_navigation(project, current_note_to_save=note, next_note=selected_note)
 
-    brand_col, title_group_col, spacer_col, view_col, archive_col = st.columns(
-        [0.32, 0.36, 0.16, 0.08, 0.08],
+    history_revision = active_history_revision(note)
+    is_history_view = history_revision is not None
+
+    brand_col, title_group_col, spacer_col, view_col, history_col, archive_col = st.columns(
+        [0.32, 0.36, 0.08, 0.08, 0.08, 0.08],
         vertical_alignment="center",
     )
     with brand_col:
@@ -929,36 +1000,63 @@ def main() -> None:
                 key="open_rename_note",
                 help="Rename note",
                 icon=":material/drive_file_rename_outline:",
+                disabled=is_history_view,
             ):
                 rename_note_dialog(project, note)
     with spacer_col:
         st.write("")
     with view_col:
-        source_visible = bool(st.session_state.get("source_visible", False))
-        next_source_visible = not source_visible
-        toggle_help = "View only" if source_visible else "Edit"
-        toggle_icon = ":material/visibility:" if source_visible else ":material/edit:"
+        if is_history_view:
+            if st.button("Current", key="return_current_note", icon=":material/history_toggle_off:"):
+                clear_history_revision()
+                st.session_state.source_visible = True
+                st.rerun()
+        else:
+            source_visible = bool(st.session_state.get("source_visible", False))
+            next_source_visible = not source_visible
+            toggle_help = "View only" if source_visible else "Edit"
+            toggle_icon = ":material/visibility:" if source_visible else ":material/edit:"
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="toggle_source_visible",
+                help=toggle_help,
+                icon=toggle_icon,
+            ):
+                if source_visible:
+                    save_editor_state(note)
+                st.session_state.source_visible = next_source_visible
+                st.rerun()
+    with history_col:
         if st.button(
             ICON_BUTTON_LABEL,
-            key="toggle_source_visible",
-            help=toggle_help,
-            icon=toggle_icon,
+            key="open_note_history",
+            help="History",
+            icon=":material/history:",
         ):
-            if source_visible:
-                save_editor_state(note)
-            st.session_state.source_visible = next_source_visible
-            st.rerun()
+            note_history_dialog(project, note)
     with archive_col:
         if st.button(
             ICON_BUTTON_LABEL,
             key="open_archive_note",
             help="Archive note",
             icon=":material/archive:",
-            disabled=note.name == HOME_NOTE,
+            disabled=note.name == HOME_NOTE or is_history_view,
         ):
             archive_note_dialog(project, note)
 
-    if st.session_state.get("source_visible", False):
+    if is_history_view:
+        try:
+            edited_content = git_file_at_revision(project.path, note.path, history_revision)
+        except GitError as exc:
+            st.error(f"Could not read historical note revision: {exc}")
+            clear_history_revision()
+            st.rerun()
+        st.markdown(
+            f'<div class="la-history-badge">Historical view · {html.escape(str(st.session_state.get("history_label") or history_revision[:7]))}</div>',
+            unsafe_allow_html=True,
+        )
+        render_preview(project, note, edited_content, allow_actions=False, source_suffix=f":{history_revision}")
+    elif st.session_state.get("source_visible", False):
         editor_col, preview_col = resizable_columns([0.52, 0.48], min_width=320, key="editor_preview_columns")
         with editor_col:
             edited_content = render_editor(note)
@@ -972,8 +1070,10 @@ def main() -> None:
         edited_content = read_note(note)
         render_preview(project, note, edited_content)
 
-    action_result = parse_note_actions(edited_content)
-    apply_requested_action(note, action_result.actions)
+    action_source = read_note(note) if is_history_view else edited_content
+    action_result = parse_note_actions(action_source)
+    if not is_history_view:
+        apply_requested_action(note, action_result.actions)
     for error in action_result.errors:
         st.warning(f"Action block at line {error.line}: {error.message}")
 
@@ -982,7 +1082,8 @@ def main() -> None:
     if st.session_state.last_agent_response:
         st.markdown(st.session_state.last_agent_response)
 
-    render_agent_panel(project, note, action_result.actions, tools_dir)
+    if not is_history_view:
+        render_agent_panel(project, note, action_result.actions, tools_dir)
 
 
 if __name__ == "__main__":

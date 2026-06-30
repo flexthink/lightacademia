@@ -161,6 +161,21 @@ h3 {
     margin: 0;
 }
 
+.la-history-badge {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    margin: 0.1rem 0 0.55rem;
+    padding: 0.28rem 0.55rem;
+    border: 1px solid rgba(143, 63, 53, 0.36);
+    border-radius: 999px;
+    background: rgba(238, 231, 215, 0.82);
+    color: var(--la-burgundy-dark);
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+    font-size: 0.86rem;
+    font-weight: 700;
+}
+
 .la-note-title {
     margin: 0.15rem 0 0.45rem;
     color: var(--la-burgundy-dark);

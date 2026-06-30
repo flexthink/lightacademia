@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import subprocess
 from pathlib import Path
 
 
 class GitError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class GitFileRevision:
+    commit: str
+    committed_at: datetime
+    author: str
+    subject: str
 
 
 def run_git(project_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -71,3 +81,40 @@ def git_mv(project_dir: Path, source: Path, target: Path) -> None:
         run_git(project_dir, "mv", str(source.relative_to(project_dir)), str(target.relative_to(project_dir)))
     else:
         source.rename(target)
+
+
+def git_file_history(project_dir: Path, path: Path, limit: int = 50) -> list[GitFileRevision]:
+    if not (project_dir / ".git").exists():
+        return []
+    relative_path = str(path.relative_to(project_dir))
+    result = run_git(
+        project_dir,
+        "log",
+        "--follow",
+        f"--max-count={limit}",
+        "--format=%H%x09%ct%x09%an%x09%s",
+        "--",
+        relative_path,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    revisions = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) != 4:
+            continue
+        commit, timestamp, author, subject = parts
+        try:
+            committed_at = datetime.fromtimestamp(int(timestamp), tz=timezone.utc).astimezone()
+        except ValueError:
+            continue
+        revisions.append(GitFileRevision(commit, committed_at, author, subject))
+    return revisions
+
+
+def git_file_at_revision(project_dir: Path, path: Path, commit: str) -> str:
+    relative_path = str(path.relative_to(project_dir))
+    result = run_git(project_dir, "show", f"{commit}:{relative_path}")
+    return result.stdout
