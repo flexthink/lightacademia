@@ -17,6 +17,10 @@ class AgentError(RuntimeError):
     pass
 
 
+class AgentStopped(AgentError):
+    pass
+
+
 @dataclass(frozen=True)
 class AgentContext:
     project_dir: Path
@@ -42,6 +46,7 @@ class AgentProgress:
 
 
 ProgressCallback = Callable[[AgentProgress], None]
+StopCallback = Callable[[], bool]
 DEFAULT_PROMPT_TEMPLATE = Path(__file__).resolve().parent.parent / "AGENT_PROMPT.md"
 
 
@@ -53,6 +58,7 @@ class Agent(Protocol):
         prompt: str,
         context: AgentContext,
         on_progress: ProgressCallback | None = None,
+        should_stop: StopCallback | None = None,
     ) -> AgentResult:
         pass
 
@@ -79,6 +85,7 @@ class CodexCliAgent:
         prompt: str,
         context: AgentContext,
         on_progress: ProgressCallback | None = None,
+        should_stop: StopCallback | None = None,
     ) -> AgentResult:
         executable = shutil.which(self.executable)
         if executable is None:
@@ -93,6 +100,7 @@ class CodexCliAgent:
                 command,
                 self._build_prompt(prompt, context, tools_workspace),
                 on_progress,
+                should_stop,
             )
             response = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
             if result["returncode"] != 0:
@@ -145,6 +153,7 @@ class CodexCliAgent:
         command: list[str],
         prompt: str,
         on_progress: ProgressCallback | None,
+        should_stop: StopCallback | None = None,
     ) -> dict[str, Any]:
         process = subprocess.Popen(
             command,
@@ -189,6 +198,14 @@ class CodexCliAgent:
             deadline = time.monotonic() + self.timeout_seconds
             closed_streams: set[str] = set()
             while len(closed_streams) < 2:
+                if should_stop is not None and should_stop():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise AgentStopped("Agent run stopped by user.")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     process.kill()

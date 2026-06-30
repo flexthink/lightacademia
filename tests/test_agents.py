@@ -8,6 +8,7 @@ from lightacademia.agents import (
     AgentContext,
     AgentProgress,
     CodexCliAgent,
+    AgentStopped,
     codex_progress_from_event,
     codex_tool_action_from_event,
 )
@@ -125,6 +126,29 @@ print("diagnostic", file=sys.stderr, flush=True)
         self.assertEqual(result["tool_actions"], ["ls"])
         self.assertIn("diagnostic", result["stderr"])
         self.assertTrue(any("Checking files" in item.text for item in progress))
+
+    def test_stop_callback_terminates_streaming_subprocess(self) -> None:
+        script = """
+import json
+import sys
+import time
+
+sys.stdin.read()
+print(json.dumps({"type": "turn.started"}), flush=True)
+time.sleep(30)
+"""
+        progress: list[AgentProgress] = []
+        agent = CodexCliAgent(timeout_seconds=30)
+
+        with self.assertRaises(AgentStopped):
+            agent._run_streaming(
+                [sys.executable, "-u", "-c", script],
+                "test prompt",
+                progress.append,
+                should_stop=lambda: bool(progress),
+            )
+
+        self.assertTrue(progress)
 
 
 if __name__ == "__main__":

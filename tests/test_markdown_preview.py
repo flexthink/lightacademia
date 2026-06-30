@@ -7,6 +7,7 @@ from lightacademia.markdown_preview import (
     ProjectImageError,
     find_standalone_images,
     resolve_project_image,
+    rewrite_project_note_links,
 )
 
 
@@ -51,6 +52,30 @@ class ResolveProjectImageTest(unittest.TestCase):
             resolve_project_image(PROJECT_ROOT, "assets/missing.png")
         with self.assertRaisesRegex(ProjectImageError, "Unsupported"):
             resolve_project_image(PROJECT_ROOT, "assets/theme.css")
+
+
+class RewriteProjectNoteLinksTest(unittest.TestCase):
+    def test_rewrites_root_note_links_to_query_params(self) -> None:
+        markdown, errors = rewrite_project_note_links("See [Spec](PRD.md).\n", PROJECT_ROOT)
+
+        self.assertEqual(errors, ())
+        self.assertIn("[Spec](?project=lightacademia&note=PRD.md)", markdown)
+
+    def test_does_not_rewrite_code_or_images(self) -> None:
+        source = "Inline `[Spec](PRD.md)` and ![Spec](PRD.md), then [Spec](PRD.md).\n"
+
+        markdown, errors = rewrite_project_note_links(source, PROJECT_ROOT)
+
+        self.assertEqual(errors, ())
+        self.assertIn("`[Spec](PRD.md)`", markdown)
+        self.assertIn("![Spec](PRD.md)", markdown)
+        self.assertIn("[Spec](?project=lightacademia&note=PRD.md)", markdown)
+
+    def test_reports_missing_note_links(self) -> None:
+        markdown, errors = rewrite_project_note_links("See [Missing](Missing.md).\n", PROJECT_ROOT)
+
+        self.assertEqual(markdown, "See [Missing](Missing.md).\n")
+        self.assertEqual(errors, ("Note not found: `Missing.md`.",))
 
 
 if __name__ == "__main__":
