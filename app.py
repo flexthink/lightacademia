@@ -901,6 +901,14 @@ def main() -> None:
 
     project = current_project(projects)
     if project is None:
+        with st.sidebar:
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_new_project_empty",
+                help="New project",
+                icon=":material/create_new_folder:",
+            ):
+                new_project_dialog(notebook_dir)
         render_app_header()
         st.info("Create a project to get started.")
         return
