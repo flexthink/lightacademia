@@ -161,6 +161,33 @@ h3 {
     margin: 0;
 }
 
+.st-key-header_actions {
+    display: flex;
+    justify-content: flex-end;
+}
+
+.st-key-header_actions button[kind="secondary"] {
+    min-height: 2.05rem;
+    width: 2.05rem;
+    padding: 0.25rem;
+    border-radius: 6px;
+    background: rgba(255, 250, 241, 0.48);
+    box-shadow: none;
+}
+
+.st-key-header_actions button[kind="secondary"]:hover {
+    background: rgba(255, 250, 241, 0.92);
+}
+
+.st-key-header_actions button[kind="secondary"] [data-testid="stIconMaterial"] {
+    font-size: 1.05rem;
+}
+
+.st-key-return_current_note button[kind="secondary"] {
+    width: auto;
+    padding: 0.25rem 0.58rem;
+}
+
 .la-history-badge {
     display: inline-flex;
     align-items: center;

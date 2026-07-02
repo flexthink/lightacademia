@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
@@ -30,7 +31,7 @@ from lightacademia.agents import (
     AgentStopped,
     default_agent,
 )
-from lightacademia.chat import append_chat_entry
+from lightacademia.chat import append_chat_entry, list_chat_log_dates, read_chat_log
 from lightacademia.git_ops import (
     GitError,
     GitFileRevision,
@@ -357,6 +358,28 @@ def note_history_dialog(project: Project, note) -> None:
                 st.session_state.history_label = history_entry_label(revision)
                 st.session_state.source_visible = False
                 st.rerun()
+
+
+@st.dialog("Agent chat history", icon=":material/forum:")
+def chat_history_dialog(project: Project) -> None:
+    available_dates = list_chat_log_dates(project.path)
+    default_date = available_dates[0] if available_dates else date.today()
+    selected_date = st.date_input(
+        "Date",
+        value=default_date,
+        key=f"chat_history_date_{project.name}",
+    )
+
+    if isinstance(selected_date, tuple):
+        selected_date = selected_date[0] if selected_date else default_date
+
+    content = read_chat_log(project.path, selected_date)
+    if not content.strip():
+        st.info(f"No agent chats recorded for {selected_date:%Y-%m-%d}.")
+        return
+
+    with st.container(height=560, border=True):
+        st.markdown(content)
 
 
 def init_state() -> None:
@@ -829,7 +852,7 @@ def render_agent_progress_panel() -> None:
         return
     drain_agent_progress(run_state)
     entries = st.session_state.get("agent_progress_entries", [])
-    status_label = "Stopping Codex..." if run_state.stop_requested.is_set() else "Codex is working..."
+    status_label = "Stopping 🤖 Robot..." if run_state.stop_requested.is_set() else "🤖 Robot is working..."
     with st.status(status_label, expanded=True, state="running"):
         stop_col, _ = st.columns([0.2, 0.8])
         with stop_col:
@@ -842,7 +865,7 @@ def render_agent_progress_panel() -> None:
                 run_state.stop_requested.set()
                 st.rerun()
         st.container(height=220, border=False).code(
-            "\n\n".join(entries) if entries else "Waiting for Codex output...",
+            "\n\n".join(entries) if entries else "Waiting for 🤖 Robot output...",
             language=None,
         )
     if run_state.done:
@@ -989,8 +1012,8 @@ def main() -> None:
     history_revision = active_history_revision(note)
     is_history_view = history_revision is not None
 
-    brand_col, title_group_col, spacer_col, view_col, history_col, archive_col = st.columns(
-        [0.32, 0.36, 0.08, 0.08, 0.08, 0.08],
+    brand_col, title_group_col, spacer_col, actions_col = st.columns(
+        [0.30, 0.39, 0.07, 0.24],
         vertical_alignment="center",
     )
     with brand_col:
@@ -1013,44 +1036,55 @@ def main() -> None:
                 rename_note_dialog(project, note)
     with spacer_col:
         st.write("")
-    with view_col:
-        if is_history_view:
-            if st.button("Current", key="return_current_note", icon=":material/history_toggle_off:"):
-                clear_history_revision()
-                st.session_state.source_visible = True
-                st.rerun()
-        else:
-            source_visible = bool(st.session_state.get("source_visible", False))
-            next_source_visible = not source_visible
-            toggle_help = "View only" if source_visible else "Edit"
-            toggle_icon = ":material/visibility:" if source_visible else ":material/edit:"
+    with actions_col:
+        with st.container(
+            key="header_actions",
+            horizontal=True,
+            vertical_alignment="center",
+            gap="small",
+        ):
+            if is_history_view:
+                if st.button("Current", key="return_current_note", icon=":material/history_toggle_off:"):
+                    clear_history_revision()
+                    st.session_state.source_visible = True
+                    st.rerun()
+            else:
+                source_visible = bool(st.session_state.get("source_visible", False))
+                next_source_visible = not source_visible
+                toggle_help = "View only" if source_visible else "Edit"
+                toggle_icon = ":material/visibility:" if source_visible else ":material/edit:"
+                if st.button(
+                    ICON_BUTTON_LABEL,
+                    key="toggle_source_visible",
+                    help=toggle_help,
+                    icon=toggle_icon,
+                ):
+                    if source_visible:
+                        save_editor_state(note)
+                    st.session_state.source_visible = next_source_visible
+                    st.rerun()
             if st.button(
                 ICON_BUTTON_LABEL,
-                key="toggle_source_visible",
-                help=toggle_help,
-                icon=toggle_icon,
+                key="open_note_history",
+                help="History",
+                icon=":material/history:",
             ):
-                if source_visible:
-                    save_editor_state(note)
-                st.session_state.source_visible = next_source_visible
-                st.rerun()
-    with history_col:
-        if st.button(
-            ICON_BUTTON_LABEL,
-            key="open_note_history",
-            help="History",
-            icon=":material/history:",
-        ):
-            note_history_dialog(project, note)
-    with archive_col:
-        if st.button(
-            ICON_BUTTON_LABEL,
-            key="open_archive_note",
-            help="Archive note",
-            icon=":material/archive:",
-            disabled=note.name == HOME_NOTE or is_history_view,
-        ):
-            archive_note_dialog(project, note)
+                note_history_dialog(project, note)
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_chat_history",
+                help="Agent chat history",
+                icon=":material/forum:",
+            ):
+                chat_history_dialog(project)
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_archive_note",
+                help="Archive note",
+                icon=":material/archive:",
+                disabled=note.name == HOME_NOTE or is_history_view,
+            ):
+                archive_note_dialog(project, note)
 
     if is_history_view:
         try:
