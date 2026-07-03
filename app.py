@@ -38,7 +38,10 @@ from lightacademia.git_ops import (
     git_commit_all,
     git_file_at_revision,
     git_file_history,
+    git_remote_url,
+    git_set_remote_url,
     git_status_lines,
+    git_sync,
 )
 from lightacademia.markdown_preview import (
     ProjectImageError,
@@ -287,6 +290,21 @@ def archive_project_dialog(notebook_dir: Path, project: Project, current_note_to
             st.error(f"Could not archive project: {exc}")
 
 
+@st.dialog("Settings", icon=":material/settings:")
+def settings_dialog(project: Project) -> None:
+    current_remote = git_remote_url(project.path) or ""
+    remote_url = st.text_input("Remote URL", value=current_remote, key=f"remote_url_{project.name}")
+    st.caption("Leave empty and save to remove the configured remote.")
+    if st.button("Save", type="primary", icon=":material/save:"):
+        try:
+            git_set_remote_url(project.path, remote_url)
+            st.session_state.last_sync_error = None
+            st.session_state.last_sync_message = "Remote settings saved."
+            st.rerun()
+        except GitError as exc:
+            st.error(f"Could not save remote URL: {exc}")
+
+
 @st.dialog("New note", icon=":material/note_add:")
 def new_note_dialog(project: Project) -> None:
     title = st.text_input("Note title", key="new_note_title")
@@ -412,6 +430,8 @@ def init_state() -> None:
         "history_revision": None,
         "history_note_name": None,
         "history_label": None,
+        "last_sync_error": None,
+        "last_sync_message": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -716,6 +736,22 @@ def apply_requested_action(note, actions: tuple[NoteAction, ...]) -> None:
     st.session_state.requested_action = None
 
 
+def sync_project(project: Project, note) -> None:
+    save_editor_state(note)
+    with st.spinner("Syncing notebook..."):
+        try:
+            result = git_sync(project.path)
+        except GitError as exc:
+            st.session_state.last_sync_error = f"Sync failed: {exc}"
+            st.session_state.last_sync_message = None
+            st.rerun()
+
+    st.session_state.last_sync_error = None
+    st.session_state.last_sync_message = result.message
+    reload_note_from_disk()
+    st.rerun()
+
+
 def start_agent_command(
     project: Project,
     note,
@@ -1018,8 +1054,10 @@ def main() -> None:
     history_revision = active_history_revision(note)
     is_history_view = history_revision is not None
 
+    remote_configured = git_remote_url(project.path) is not None
+
     brand_col, title_group_col, spacer_col, actions_col = st.columns(
-        [0.30, 0.39, 0.07, 0.24],
+        [0.28, 0.34, 0.04, 0.34],
         vertical_alignment="center",
     )
     with brand_col:
@@ -1085,6 +1123,21 @@ def main() -> None:
                 chat_history_dialog(project)
             if st.button(
                 ICON_BUTTON_LABEL,
+                key="open_settings",
+                help="Settings",
+                icon=":material/settings:",
+            ):
+                settings_dialog(project)
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="sync_project",
+                help="Sync",
+                icon=":material/sync:",
+                disabled=not remote_configured or is_history_view,
+            ):
+                sync_project(project, note)
+            if st.button(
+                ICON_BUTTON_LABEL,
                 key="open_archive_note",
                 help="Archive note",
                 icon=":material/archive:",
@@ -1124,6 +1177,11 @@ def main() -> None:
         apply_requested_action(note, action_result.actions)
     for error in action_result.errors:
         st.warning(f"Action block at line {error.line}: {error.message}")
+
+    if st.session_state.last_sync_error:
+        st.warning(st.session_state.last_sync_error)
+    elif st.session_state.last_sync_message:
+        st.info(st.session_state.last_sync_message)
 
     if st.session_state.last_agent_error:
         st.error(st.session_state.last_agent_error)
