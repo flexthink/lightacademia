@@ -314,8 +314,224 @@ class CodexCliAgent:
         return [name for name in names if (Path(directory) / name).is_symlink()]
 
 
-def default_agent() -> Agent:
-    return CodexCliAgent()
+class ClaudeCliAgent(CodexCliAgent):
+    name = "Claude CLI"
+
+    def __init__(
+        self,
+        executable: str = "claude",
+        permission_mode: str = "acceptEdits",
+        timeout_seconds: int = 900,
+        prompt_template: Path | None = None,
+    ) -> None:
+        super().__init__(
+            executable=executable,
+            timeout_seconds=timeout_seconds,
+            prompt_template=prompt_template,
+        )
+        self.permission_mode = permission_mode
+
+    def run(
+        self,
+        prompt: str,
+        context: AgentContext,
+        on_progress: ProgressCallback | None = None,
+        should_stop: StopCallback | None = None,
+    ) -> AgentResult:
+        executable = shutil.which(self.executable)
+        if executable is None:
+            raise AgentError(f"Could not find `{self.executable}` on PATH.")
+
+        with tempfile.TemporaryDirectory(prefix="lightacademia-claude-") as tmpdir:
+            tools_workspace = Path(tmpdir) / "tools"
+            self._copy_tools_dir(context.tools_dir, tools_workspace)
+            command = self._build_command(executable, context, tools_workspace)
+            result = self._run_streaming(
+                command,
+                self._build_prompt(prompt, context, tools_workspace),
+                on_progress,
+                should_stop,
+                cwd=context.project_dir,
+            )
+            if result["returncode"] != 0:
+                detail = result["stderr"].strip() or result["error"].strip() or "Claude CLI failed."
+                raise AgentError(detail)
+            return AgentResult(
+                response=result["last_agent_message"].strip(),
+                tool_actions=result["tool_actions"],
+                raw_stdout=result["stdout"],
+                raw_stderr=result["stderr"],
+                returncode=result["returncode"],
+            )
+
+    def _build_command(
+        self,
+        executable: str,
+        context: AgentContext,
+        tools_workspace: Path,
+    ) -> list[str]:
+        return [
+            executable,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            self.permission_mode,
+            "--add-dir",
+            str(tools_workspace),
+            "--allowedTools",
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Bash",
+            "Glob",
+            "Grep",
+            "LS",
+        ]
+
+    def _run_streaming(
+        self,
+        command: list[str],
+        prompt: str,
+        on_progress: ProgressCallback | None,
+        should_stop: StopCallback | None = None,
+        cwd: Path | None = None,
+    ) -> dict[str, Any]:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            cwd=cwd,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        tool_actions: list[str] = []
+        errors: list[str] = []
+        last_agent_message = ""
+
+        def pump_stream(name: str, stream: IO[str]) -> None:
+            try:
+                for line in stream:
+                    output_queue.put((name, line))
+            finally:
+                output_queue.put((name, None))
+
+        readers = [
+            threading.Thread(target=pump_stream, args=("stdout", process.stdout), daemon=True),
+            threading.Thread(target=pump_stream, args=("stderr", process.stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+
+        try:
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+            deadline = time.monotonic() + self.timeout_seconds
+            closed_streams: set[str] = set()
+            while len(closed_streams) < 2:
+                if should_stop is not None and should_stop():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise AgentStopped("Agent run stopped by user.")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    process.wait()
+                    raise AgentError(f"Claude CLI timed out after {self.timeout_seconds} seconds.")
+                try:
+                    source, line = output_queue.get(timeout=min(0.25, remaining))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    closed_streams.add(source)
+                    continue
+                if source == "stderr":
+                    stderr_lines.append(line)
+                    continue
+
+                stdout_lines.append(line)
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                progress = claude_progress_from_event(event)
+                if progress is not None and on_progress is not None:
+                    on_progress(progress)
+                tool_action = claude_tool_action_from_event(event)
+                if tool_action:
+                    tool_actions.append(tool_action)
+                if event.get("type") == "error":
+                    errors.append(event_text(event))
+                message_text = claude_result_text_from_event(event)
+                if not message_text and event.get("type") == "assistant":
+                    message_text = claude_message_text(event.get("message"))
+                if message_text:
+                    last_agent_message = message_text
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise AgentError(f"Claude CLI timed out after {self.timeout_seconds} seconds.")
+            try:
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.wait()
+                raise AgentError(
+                    f"Claude CLI timed out after {self.timeout_seconds} seconds."
+                ) from exc
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+        finally:
+            for reader in readers:
+                reader.join(timeout=1)
+            process.stdout.close()
+            process.stderr.close()
+
+        return {
+            "returncode": returncode,
+            "stdout": "".join(stdout_lines),
+            "stderr": "".join(stderr_lines),
+            "tool_actions": tool_actions,
+            "error": "\n".join(error for error in errors if error),
+            "last_agent_message": last_agent_message,
+        }
+
+
+def create_agent(kind: str) -> Agent:
+    normalized = kind.strip().lower()
+    if normalized == "codex":
+        return CodexCliAgent()
+    if normalized in {"claude", "claude-code", "claude_code"}:
+        return ClaudeCliAgent()
+    raise AgentError(f"Unknown agent: {kind}. Expected one of: codex, claude.")
+
+
+def default_agent(kind: str = "codex") -> Agent:
+    return create_agent(kind)
 
 
 def event_text(value: Any) -> str:
@@ -404,6 +620,73 @@ def codex_tool_action_from_event(event: dict[str, Any]) -> str | None:
         )
         return f"MCP: {name}" if name else "MCP tool call"
     return None
+
+
+def claude_progress_from_event(event: dict[str, Any]) -> AgentProgress | None:
+    event_type = str(event.get("type") or "event")
+    if event_type == "system":
+        subtype = str(event.get("subtype") or "system")
+        return AgentProgress(event_type, f"System: {subtype}")
+    if event_type == "assistant":
+        text = claude_message_text(event.get("message"))
+        return AgentProgress(event_type, text or _pretty_event(event))
+    if event_type == "result":
+        detail = claude_result_text_from_event(event) or _pretty_event(event)
+        return AgentProgress(event_type, detail)
+    if event_type == "error":
+        return AgentProgress(event_type, event_text(event) or _pretty_event(event))
+    return AgentProgress(event_type, event_text(event) or _pretty_event(event))
+
+
+def claude_tool_action_from_event(event: dict[str, Any]) -> str | None:
+    if event.get("type") != "assistant":
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None
+    for block in message.get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = str(block.get("name") or "tool")
+        tool_input = block.get("input")
+        if name == "Bash" and isinstance(tool_input, dict) and tool_input.get("command"):
+            return str(tool_input["command"])
+        return name
+    return None
+
+
+def claude_result_text_from_event(event: dict[str, Any]) -> str:
+    if event.get("type") != "result":
+        return ""
+    result = event.get("result")
+    if isinstance(result, str):
+        return result
+    return event_text(result)
+
+
+def claude_message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return event_text(message)
+    parts = []
+    for block in message.get("content") or []:
+        if not isinstance(block, dict):
+            text = event_text(block)
+            if text:
+                parts.append(text)
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = event_text(block)
+            if text:
+                parts.append(text)
+        elif block_type == "tool_use":
+            name = str(block.get("name") or "tool")
+            tool_input = block.get("input")
+            if name == "Bash" and isinstance(tool_input, dict) and tool_input.get("command"):
+                parts.append(f"$ {tool_input['command']}")
+            else:
+                parts.append(f"{name}: {_pretty_value(tool_input)}")
+    return "\n".join(parts)
 
 
 def _pretty_value(value: Any) -> str:

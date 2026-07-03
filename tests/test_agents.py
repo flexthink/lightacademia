@@ -7,8 +7,12 @@ from pathlib import Path
 from lightacademia.agents import (
     AgentContext,
     AgentProgress,
-    CodexCliAgent,
     AgentStopped,
+    ClaudeCliAgent,
+    CodexCliAgent,
+    create_agent,
+    claude_progress_from_event,
+    claude_tool_action_from_event,
     codex_progress_from_event,
     codex_tool_action_from_event,
 )
@@ -49,6 +53,30 @@ class CodexProgressTest(unittest.TestCase):
         )
 
         self.assertIn("sandbox_workspace_write.network_access=true", command)
+
+    def test_claude_command_uses_stream_json_print_mode(self) -> None:
+        agent = ClaudeCliAgent()
+        context = AgentContext(
+            project_dir=Path("/project"),
+            project_name="project",
+            tools_dir=Path("/tools"),
+            current_note="Home.md",
+        )
+
+        command = agent._build_command("claude", context, Path("/temporary/tools"))
+
+        self.assertEqual(command[:5], ["claude", "--print", "--output-format", "stream-json", "--verbose"])
+        self.assertIn("--permission-mode", command)
+        self.assertIn("acceptEdits", command)
+        self.assertIn("--add-dir", command)
+        self.assertIn("/temporary/tools", command)
+        self.assertIn("--allowedTools", command)
+        self.assertIn("Bash", command)
+        self.assertNotIn("-", command)
+
+    def test_create_agent_selects_cli_implementation(self) -> None:
+        self.assertIsInstance(create_agent("codex"), CodexCliAgent)
+        self.assertIsInstance(create_agent("claude"), ClaudeCliAgent)
 
     def test_preserves_reasoning_text(self) -> None:
         progress = codex_progress_from_event(
@@ -96,6 +124,26 @@ class CodexProgressTest(unittest.TestCase):
 
         self.assertEqual(action, "ls data")
 
+    def test_extracts_claude_progress_and_tool_action(self) -> None:
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Checking files."},
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls data"}},
+                ]
+            },
+        }
+
+        progress = claude_progress_from_event(event)
+        action = claude_tool_action_from_event(event)
+
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertIn("Checking files.", progress.text)
+        self.assertIn("$ ls data", progress.text)
+        self.assertEqual(action, "ls data")
+
     def test_streams_jsonl_subprocess_without_model_call(self) -> None:
         script = """
 import json
@@ -114,6 +162,39 @@ print("diagnostic", file=sys.stderr, flush=True)
 """
         progress: list[AgentProgress] = []
         agent = CodexCliAgent(timeout_seconds=5)
+
+        result = agent._run_streaming(
+            [sys.executable, "-u", "-c", script],
+            "test prompt",
+            progress.append,
+        )
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["last_agent_message"], "Done.")
+        self.assertEqual(result["tool_actions"], ["ls"])
+        self.assertIn("diagnostic", result["stderr"])
+        self.assertTrue(any("Checking files" in item.text for item in progress))
+
+    def test_streams_claude_jsonl_subprocess_without_model_call(self) -> None:
+        script = """
+import json
+import sys
+
+sys.stdin.read()
+events = [
+    {"type": "system", "subtype": "init"},
+    {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "Checking files."},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+    ]}},
+    {"type": "result", "result": "Done."},
+]
+for event in events:
+    print(json.dumps(event), flush=True)
+print("diagnostic", file=sys.stderr, flush=True)
+"""
+        progress: list[AgentProgress] = []
+        agent = ClaudeCliAgent(timeout_seconds=5)
 
         result = agent._run_streaming(
             [sys.executable, "-u", "-c", script],

@@ -85,6 +85,13 @@ the `{{project_name}}`, `{{project_dir}}`, `{{tools_dir}}`, `{{tools_root}}`,
 `{{current_note}}`, and `{{user_prompt}}` placeholders where their runtime values
 should be inserted.
 
+Select the agent implementation at startup:
+
+```bash
+python -m streamlit run app.py -- --agent codex
+python -m streamlit run app.py -- --agent claude
+```
+
 The default implementation uses the Codex CLI:
 
 - Runs `codex exec`
@@ -104,3 +111,11 @@ The default implementation uses the Codex CLI:
 - Tells Codex not to run git commands
 - Leaves git checkpoints and commits to the application
 - Uses `[agent]`-prefixed commit messages for commits created after agent actions
+
+Claude Code CLI support is also available with `--agent claude`:
+
+- Runs `claude --print --output-format stream-json --verbose`
+- Uses the selected project as the working root
+- Adds a temporary copy of the configured tools folder with `--add-dir`
+- Uses `acceptEdits` permission mode and allows common file/shell tools
+- Streams Claude JSON events into the same pinned agent progress section

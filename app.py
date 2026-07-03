@@ -210,6 +210,7 @@ class AppConfig:
     notebook_dir: Path
     tools_dir: Path
     autocommit_seconds: int
+    agent: str
 
 
 @dataclass
@@ -219,6 +220,7 @@ class AgentRunState:
     note_name: str
     prompt: str
     tools_dir: Path
+    agent: str
     before_status: set[str]
     progress: queue.Queue[AgentProgress]
     stop_requested: threading.Event
@@ -240,11 +242,13 @@ def get_config() -> AppConfig:
     parser.add_argument("--notebook", type=Path, default=DEFAULT_NOTEBOOK_DIR)
     parser.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--autocommit-seconds", type=int, default=DEFAULT_AUTOCOMMIT_SECONDS)
+    parser.add_argument("--agent", choices=("codex", "claude"), default="codex")
     args, _ = parser.parse_known_args()
     return AppConfig(
         notebook_dir=args.notebook.expanduser(),
         tools_dir=args.tools.expanduser(),
         autocommit_seconds=max(30, args.autocommit_seconds),
+        agent=args.agent,
     )
 
 
@@ -717,6 +721,7 @@ def start_agent_command(
     note,
     prompt: str,
     tools_dir: Path,
+    agent: str,
 ) -> AgentRunState:
     save_editor_state(note)
     git_commit_all(project.path, "Checkpoint before agent command")
@@ -729,6 +734,7 @@ def start_agent_command(
         note_name=note.name if note is not None else "",
         prompt=prompt,
         tools_dir=tools_dir,
+        agent=agent,
         before_status=set(git_status_lines(project.path)),
         progress=queue.Queue(),
         stop_requested=threading.Event(),
@@ -750,7 +756,7 @@ def start_agent_command(
 
 
 def _agent_worker(run_state: AgentRunState) -> None:
-    agent = default_agent()
+    agent = default_agent(run_state.agent)
     context = AgentContext(
         project_dir=run_state.project.path,
         project_name=run_state.project.name,
@@ -897,7 +903,7 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
             else prompt.strip()
         )
         try:
-            start_agent_command(project, note, agent_prompt, tools_dir)
+            start_agent_command(project, note, agent_prompt, tools_dir, get_config().agent)
             st.session_state.last_agent_error = None
         except (OSError, GitError, AgentError) as exc:
             st.session_state.last_agent_error = f"Could not start agent: {exc}"
