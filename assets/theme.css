@@ -147,14 +147,22 @@ h3 {
 }
 
 .st-key-open_rename_note button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     min-height: 2rem;
     width: 2rem;
     padding: 0.25rem;
     transform: translateY(0.22rem);
 }
 
+.st-key-open_rename_note button p {
+    display: none;
+}
+
 .st-key-open_rename_note button [data-testid="stIconMaterial"] {
     font-size: 1.1rem;
+    margin: 0;
 }
 
 .st-key-note_title_action [data-testid="stMarkdownContainer"] p {
@@ -167,6 +175,9 @@ h3 {
 }
 
 .st-key-header_actions button[kind="secondary"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     min-height: 2.05rem;
     width: 2.05rem;
     padding: 0.25rem;
@@ -181,11 +192,20 @@ h3 {
 
 .st-key-header_actions button[kind="secondary"] [data-testid="stIconMaterial"] {
     font-size: 1.05rem;
+    margin: 0;
+}
+
+.st-key-header_actions button[kind="secondary"] p {
+    display: none;
 }
 
 .st-key-return_current_note button[kind="secondary"] {
     width: auto;
     padding: 0.25rem 0.58rem;
+}
+
+.st-key-return_current_note button[kind="secondary"] p {
+    display: block;
 }
 
 .la-history-badge {

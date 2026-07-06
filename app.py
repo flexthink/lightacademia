@@ -49,6 +49,7 @@ from lightacademia.markdown_preview import (
     resolve_project_image,
     rewrite_project_note_links,
 )
+from lightacademia.search import SearchUnavailable, search_notes
 from lightacademia.storage import (
     HOME_NOTE,
     Project,
@@ -83,7 +84,7 @@ DEFAULT_TOOLS_DIR = Path("tools")
 DEFAULT_AUTOCOMMIT_SECONDS = 5 * 60
 PREVIEW_DEBOUNCE_SECONDS = 0.65
 NOTE_PANE_HEIGHT = 430
-ICON_BUTTON_LABEL = " "
+ICON_BUTTON_LABEL = ""
 LOGO_PATH = Path("assets/logo.png")
 THEME_CSS_PATH = Path("assets/theme.css")
 PROJECT_QUERY_PARAM = "project"
@@ -1050,6 +1051,44 @@ def main() -> None:
         )
         if selected_note != note.name:
             commit_before_navigation(project, current_note_to_save=note, next_note=selected_note)
+
+        st.divider()
+        search_key = f"note_search_{project.name}"
+        search_query = st.text_input(
+            "Search",
+            key=search_key,
+            placeholder="Search notes...",
+        )
+        if search_query.strip():
+            try:
+                search_results = search_notes(notes, search_query, limit=6)
+            except SearchUnavailable as exc:
+                st.warning(str(exc))
+                search_results = []
+            except OSError as exc:
+                st.warning(f"Could not search notes: {exc}")
+                search_results = []
+
+            if not search_results:
+                st.caption("No matches.")
+            for index, result in enumerate(search_results):
+                if st.button(
+                    note_display_name(result.note.name),
+                    key=f"search_result_{project.name}_{result.note.name}_{index}",
+                    help=result.snippet,
+                    icon=":material/search:",
+                    width="stretch",
+                ):
+                    commit_before_navigation(project, current_note_to_save=note, next_note=result.note.name)
+                st.caption(result.snippet)
+            if st.button(
+                "Clear search",
+                key=f"clear_search_{project.name}",
+                icon=":material/close:",
+                width="stretch",
+            ):
+                st.session_state[search_key] = ""
+                st.rerun()
 
     history_revision = active_history_revision(note)
     is_history_view = history_revision is not None
