@@ -7,6 +7,7 @@ import html
 import importlib.metadata
 import inspect
 import logging
+import mimetypes
 import queue
 import threading
 import time
@@ -45,6 +46,7 @@ from lightacademia.git_ops import (
 )
 from lightacademia.markdown_preview import (
     ProjectImageError,
+    find_markdown_tables,
     find_standalone_images,
     resolve_project_image,
     rewrite_project_note_links,
@@ -87,9 +89,71 @@ NOTE_PANE_HEIGHT = 430
 ICON_BUTTON_LABEL = ""
 LOGO_PATH = Path("assets/logo.png")
 THEME_CSS_PATH = Path("assets/theme.css")
+COPY_IMAGE_BUTTON_CSS_PATH = Path("assets/copy_image_button.css")
+COPY_TABLE_BUTTONS_CSS_PATH = Path("assets/copy_table_buttons.css")
 PROJECT_QUERY_PARAM = "project"
 NOTE_QUERY_PARAM = "note"
 RESIZABLE_COLUMNS_COMPONENT = "streamlit-extras.resizable_columns"
+COPY_IMAGE_BUTTON_HTML = '<button type="button" class="la-copy-image-button">📋 Copy image</button>'
+COPY_IMAGE_BUTTON_JS = """
+export default function(component) {
+  const { data, parentElement } = component;
+  const button = parentElement.querySelector("button");
+  if (!button || !data) {
+    return;
+  }
+
+  const originalLabel = data.label || "📋 Copy image";
+  button.textContent = originalLabel;
+  button.onclick = async () => {
+    try {
+      const response = await fetch(data.dataUri);
+      const blob = await response.blob();
+      await navigator.clipboard.write([
+        new ClipboardItem({ [data.mimeType]: blob })
+      ]);
+      button.textContent = data.copiedLabel || "Copied";
+      setTimeout(() => { button.textContent = originalLabel; }, 1400);
+    } catch (error) {
+      console.error(error);
+      button.textContent = data.errorLabel || "Copy failed";
+      setTimeout(() => { button.textContent = originalLabel; }, 1800);
+    }
+  };
+}
+"""
+COPY_TABLE_BUTTONS_HTML = """
+<div class="la-copy-table-buttons">
+  <button type="button" class="la-copy-table-button" data-copy-kind="markdown" title="Copy Markdown table">📋</button>
+  <button type="button" class="la-copy-table-button" data-copy-kind="latex" title="Copy LaTeX table">∑</button>
+</div>
+"""
+COPY_TABLE_BUTTONS_JS = """
+export default function(component) {
+  const { data, parentElement } = component;
+  if (!data) {
+    return;
+  }
+
+  const buttons = parentElement.querySelectorAll("button[data-copy-kind]");
+  buttons.forEach((button) => {
+    const originalLabel = button.textContent;
+    const copyKind = button.getAttribute("data-copy-kind");
+    button.onclick = async () => {
+      try {
+        const text = copyKind === "latex" ? data.latexText : data.markdownText;
+        await navigator.clipboard.writeText(text);
+        button.textContent = "✓";
+        setTimeout(() => { button.textContent = originalLabel; }, 1000);
+      } catch (error) {
+        console.error(error);
+        button.textContent = "!";
+        setTimeout(() => { button.textContent = originalLabel; }, 1400);
+      }
+    };
+  });
+}
+"""
 EDITOR_COMPONENT_CSS = """
 :root {
   --streamlit-light-background-color: #fffaf1;
@@ -150,6 +214,28 @@ def apply_theme() -> None:
     if THEME_CSS_PATH.exists():
         css = THEME_CSS_PATH.read_text(encoding="utf-8")
         st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+
+@lru_cache(maxsize=1)
+def copy_image_button_component():
+    css = COPY_IMAGE_BUTTON_CSS_PATH.read_text(encoding="utf-8") if COPY_IMAGE_BUTTON_CSS_PATH.exists() else ""
+    return st.components.v2.component(
+        "copy_image_button",
+        html=COPY_IMAGE_BUTTON_HTML,
+        css=css,
+        js=COPY_IMAGE_BUTTON_JS,
+    )
+
+
+@lru_cache(maxsize=1)
+def copy_table_buttons_component():
+    css = COPY_TABLE_BUTTONS_CSS_PATH.read_text(encoding="utf-8") if COPY_TABLE_BUTTONS_CSS_PATH.exists() else ""
+    return st.components.v2.component(
+        "copy_table_buttons",
+        html=COPY_TABLE_BUTTONS_HTML,
+        css=css,
+        js=COPY_TABLE_BUTTONS_JS,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -653,12 +739,16 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
     events = []
     if allow_actions:
         events.extend(
-            (action.line - 1, action.line - 1, "action", action)
+            (action.line - 1, action.end_line, "action", action)
             for action in parse_note_actions(markdown).actions
         )
     events.extend(
         (image.start_line, image.end_line, "image", image)
         for image in find_standalone_images(markdown)
+    )
+    events.extend(
+        (table.start_line, table.end_line, "table", table)
+        for table in find_markdown_tables(markdown)
     )
     events.sort(key=lambda event: (event[0], event[2]))
 
@@ -680,13 +770,21 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
             ):
                 st.session_state.requested_action = event
                 st.rerun()
-        else:
+            with st.expander("Action description", expanded=False):
+                action_markdown = "".join(lines[start_line:end_line])
+                if action_markdown.strip():
+                    st.markdown(action_markdown)
+        elif event_type == "image":
             try:
                 image_path = resolve_project_image(project_dir, event.target)
             except ProjectImageError as exc:
                 st.warning(str(exc))
             else:
+                render_copyable_image(image_path, event.alt, source_key, start_line)
                 st.image(image_path, caption=event.alt or None, width="stretch")
+        else:
+            table_markdown = "".join(lines[start_line:end_line])
+            render_copyable_table(table_markdown, event.copy_text, event.latex_text, source_key, start_line)
         rendered = True
         cursor = end_line
 
@@ -696,6 +794,36 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
         rendered = True
     if not rendered:
         st.markdown(" ")
+
+
+def render_copyable_table(table_markdown: str, copy_text: str, latex_text: str, source_key: str, start_line: int) -> None:
+    copy_key = hashlib.sha256(f"{source_key}:table:{start_line}:{copy_text}".encode("utf-8")).hexdigest()[:16]
+    copy_table_buttons_component()(
+        data={"markdownText": copy_text, "latexText": latex_text},
+        key=f"copy_table_buttons_{copy_key}",
+        height=42,
+    )
+    st.markdown(table_markdown)
+
+
+def render_copyable_image(image_path: Path, alt: str, source_key: str, start_line: int) -> None:
+    mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+    if not mime_type.startswith("image/"):
+        return
+
+    copy_key = hashlib.sha256(f"{source_key}:image:{start_line}:{image_path}".encode("utf-8")).hexdigest()[:16]
+    data_uri = f"data:{mime_type};base64,{base64.b64encode(image_path.read_bytes()).decode('ascii')}"
+    copy_image_button_component()(
+        data={
+            "dataUri": data_uri,
+            "mimeType": mime_type,
+            "label": "📋 Copy image",
+            "copiedLabel": "Copied",
+            "errorLabel": "Copy failed",
+        },
+        key=f"copy_image_{copy_key}",
+        height=44,
+    )
 
 
 def render_preview(project: Project, note, content: str, allow_actions: bool = True, source_suffix: str = "") -> None:

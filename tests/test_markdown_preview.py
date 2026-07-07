@@ -5,7 +5,10 @@ from pathlib import Path
 
 from lightacademia.markdown_preview import (
     ProjectImageError,
+    find_markdown_tables,
     find_standalone_images,
+    format_markdown_table_for_latex,
+    format_markdown_table_for_plain_text,
     resolve_project_image,
     rewrite_project_note_links,
 )
@@ -52,6 +55,53 @@ class ResolveProjectImageTest(unittest.TestCase):
             resolve_project_image(PROJECT_ROOT, "assets/missing.png")
         with self.assertRaisesRegex(ProjectImageError, "Unsupported"):
             resolve_project_image(PROJECT_ROOT, "assets/theme.css")
+
+
+class MarkdownTableTest(unittest.TestCase):
+    def test_finds_markdown_table(self) -> None:
+        source = "Before\n\n| Name | Score |\n| --- | ---: |\n| Alpha | 10 |\n| Beta longer | 2 |\n\nAfter\n"
+
+        tables = find_markdown_tables(source)
+
+        self.assertEqual(len(tables), 1)
+        self.assertEqual((tables[0].start_line, tables[0].end_line), (2, 6))
+        self.assertIn("| Beta longer | 2 |", tables[0].source)
+        self.assertIn(r"\begin{tabular}", tables[0].latex_text)
+
+    def test_ignores_tables_inside_code_fences(self) -> None:
+        source = "```markdown\n| Name | Score |\n| --- | --- |\n```\n"
+
+        self.assertEqual(find_markdown_tables(source), ())
+
+    def test_formats_table_for_plain_text_copying(self) -> None:
+        formatted = format_markdown_table_for_plain_text(
+            "| Name | Score |\n"
+            "| --- | ---: |\n"
+            "| Alpha | 10 |\n"
+            "| Beta longer | 2 |\n"
+        )
+
+        self.assertEqual(
+            formatted,
+            "| Name        |   Score |\n"
+            "|-------------|---------|\n"
+            "| Alpha       |      10 |\n"
+            "| Beta longer |       2 |",
+        )
+
+    def test_formats_table_for_latex_copying(self) -> None:
+        formatted = format_markdown_table_for_latex(
+            "| Name | Score |\n"
+            "| --- | ---: |\n"
+            "| Alpha | 10 |\n"
+            "| Beta longer | 2 |\n"
+        )
+
+        self.assertIn(r"\begin{tabular}{lr}", formatted)
+        self.assertIn(r"\toprule", formatted)
+        self.assertIn(r"Name", formatted)
+        self.assertIn(r"Beta longer &       2 \\", formatted)
+        self.assertIn(r"\end{tabular}", formatted)
 
 
 class RewriteProjectNoteLinksTest(unittest.TestCase):

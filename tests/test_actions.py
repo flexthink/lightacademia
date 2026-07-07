@@ -35,7 +35,9 @@ Add ten lines of Lorem Ipsum.
         )
         self.assertEqual(result.actions[0].instructions, "Retrieve this.\nPlot this.")
         self.assertEqual(result.actions[0].line, 3)
+        self.assertEqual(result.actions[0].end_line, 8)
         self.assertEqual(result.actions[1].line, 14)
+        self.assertEqual(result.actions[1].end_line, 18)
         self.assertEqual(result.errors, ())
 
     def test_reports_malformed_blocks_without_losing_valid_actions(self) -> None:

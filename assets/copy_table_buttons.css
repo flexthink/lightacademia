@@ -1,0 +1,27 @@
+.la-copy-table-buttons {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    background: transparent;
+}
+
+.la-copy-table-button {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #d9c9ac;
+    border-radius: 7px;
+    background: rgba(255, 250, 241, 0.92);
+    color: #2e2923;
+    cursor: pointer;
+    font: 600 1rem Georgia, "Times New Roman", serif;
+    height: 2.25rem;
+    min-width: 2.65rem;
+    padding: 0 0.68rem;
+}
+
+.la-copy-table-button:hover {
+    border-color: #8f3f35;
+    background: #fffaf1;
+}

@@ -1,0 +1,17 @@
+.la-copy-image-button {
+    appearance: none;
+    border: 1px solid #d9c9ac;
+    border-radius: 7px;
+    background: rgba(255, 250, 241, 0.92);
+    color: #2e2923;
+    cursor: pointer;
+    font: 600 0.9rem Georgia, "Times New Roman", serif;
+    line-height: 1;
+    min-height: 2.25rem;
+    padding: 0.45rem 0.75rem;
+}
+
+.la-copy-image-button:hover {
+    border-color: #8f3f35;
+    background: #fffaf1;
+}

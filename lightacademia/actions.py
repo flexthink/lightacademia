@@ -10,6 +10,7 @@ class NoteAction:
     name: str
     instructions: str
     line: int
+    end_line: int
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,8 @@ def parse_note_actions(markdown: str) -> ActionParseResult:
             errors.append(ActionParseError(block_line, "Action instructions cannot be empty."))
             continue
 
-        actions.append(NoteAction(name=name, instructions=instructions, line=block_line))
+        end_line = token.map[1] if token.map else block_line
+        actions.append(NoteAction(name=name, instructions=instructions, line=block_line, end_line=end_line))
 
     return ActionParseResult(tuple(actions), tuple(errors))
 

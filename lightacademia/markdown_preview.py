@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlencode, urlsplit
 
 from markdown_it import MarkdownIt
+from tabulate import tabulate
 
 
 SUPPORTED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
@@ -30,6 +31,15 @@ class MarkdownImage:
 class MarkdownNoteLink:
     target: str
     label: str
+
+
+@dataclass(frozen=True)
+class MarkdownTable:
+    start_line: int
+    end_line: int
+    source: str
+    copy_text: str
+    latex_text: str
 
 
 _MARKDOWN = MarkdownIt("commonmark")
@@ -216,3 +226,154 @@ def resolve_project_image(project_dir: Path, target: str) -> Path:
     if not image_path.is_file():
         raise ProjectImageError(f"Image not found: `{relative_path}`.")
     return image_path
+
+
+def find_markdown_tables(markdown: str) -> tuple[MarkdownTable, ...]:
+    lines = markdown.splitlines(keepends=True)
+    protected_lines: set[int] = set()
+    for token in _MARKDOWN.parse(markdown):
+        if token.type in {"fence", "code_block"} and token.map:
+            protected_lines.update(range(token.map[0], token.map[1]))
+
+    tables: list[MarkdownTable] = []
+    line_index = 0
+    while line_index < len(lines) - 1:
+        if line_index in protected_lines or line_index + 1 in protected_lines:
+            line_index += 1
+            continue
+        if not (_looks_like_table_row(lines[line_index]) and _looks_like_separator_row(lines[line_index + 1])):
+            line_index += 1
+            continue
+
+        end_line = line_index + 2
+        while (
+            end_line < len(lines)
+            and end_line not in protected_lines
+            and _looks_like_table_row(lines[end_line])
+        ):
+            end_line += 1
+
+        source = "".join(lines[line_index:end_line])
+        tables.append(
+            MarkdownTable(
+                start_line=line_index,
+                end_line=end_line,
+                source=source,
+                copy_text=format_markdown_table_for_plain_text(source),
+                latex_text=format_markdown_table_for_latex(source),
+            )
+        )
+        line_index = end_line
+    return tuple(tables)
+
+
+def format_markdown_table_for_plain_text(markdown_table: str) -> str:
+    parsed = _parse_markdown_table(markdown_table)
+    if parsed is None:
+        return markdown_table.strip()
+    headers, body, alignments = parsed
+    return tabulate(
+        body,
+        headers=headers,
+        tablefmt="github",
+        colalign=alignments,
+        disable_numparse=True,
+    )
+
+
+def format_markdown_table_for_latex(markdown_table: str) -> str:
+    parsed = _parse_markdown_table(markdown_table)
+    if parsed is None:
+        return markdown_table.strip()
+    headers, body, alignments = parsed
+    return tabulate(
+        body,
+        headers=headers,
+        tablefmt="latex_booktabs",
+        colalign=alignments,
+        disable_numparse=True,
+    )
+
+
+def _parse_markdown_table(markdown_table: str) -> tuple[list[str], list[list[str]], tuple[str, ...]] | None:
+    rows = [_split_table_row(line) for line in markdown_table.splitlines() if line.strip()]
+    if len(rows) < 2:
+        return None
+
+    column_count = max(len(row) for row in rows)
+    normalized_rows = [row + [""] * (column_count - len(row)) for row in rows]
+    headers = [cell.strip() for cell in normalized_rows[0]]
+    body = [[cell.strip() for cell in row] for row in normalized_rows[2:]]
+    alignments = tuple(_tabulate_alignment(cell) for cell in normalized_rows[1])
+    return headers, body, alignments
+
+
+def _looks_like_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and _has_unescaped_pipe(stripped) and len(_split_table_row(stripped)) >= 2
+
+
+def _looks_like_separator_row(line: str) -> bool:
+    cells = _split_table_row(line)
+    if len(cells) < 2:
+        return False
+    return all(_is_separator_cell(cell) for cell in cells)
+
+
+def _is_separator_cell(cell: str) -> bool:
+    stripped = cell.strip()
+    if stripped.startswith(":"):
+        stripped = stripped[1:]
+    if stripped.endswith(":"):
+        stripped = stripped[:-1]
+    return len(stripped) >= 3 and set(stripped) == {"-"}
+
+
+def _tabulate_alignment(cell: str) -> str:
+    stripped = cell.strip()
+    if stripped.startswith(":") and stripped.endswith(":"):
+        return "center"
+    if stripped.endswith(":"):
+        return "right"
+    return "left"
+
+
+def _has_unescaped_pipe(line: str) -> bool:
+    escaped = False
+    for char in line:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "|":
+            return True
+    return False
+
+
+def _split_table_row(line: str) -> list[str]:
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in line.strip():
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+        if char == "|":
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    cells.append("".join(current).strip())
+
+    if cells and cells[0] == "":
+        cells = cells[1:]
+    if cells and cells[-1] == "":
+        cells = cells[:-1]
+    return cells

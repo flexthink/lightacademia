@@ -4,3 +4,4 @@ streamlit-code-editor
 markdown-it-py>=3.0,<5
 streamlit-extras
 bm25s
+tabulate
