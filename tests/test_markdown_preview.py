@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from lightacademia.markdown_preview import (
+    ProjectDataframeError,
     ProjectImageError,
     find_markdown_tables,
+    find_standalone_dataframes,
     find_standalone_images,
     format_markdown_table_for_latex,
     format_markdown_table_for_plain_text,
+    resolve_project_dataframe,
     resolve_project_image,
     rewrite_project_note_links,
 )
@@ -55,6 +59,70 @@ class ResolveProjectImageTest(unittest.TestCase):
             resolve_project_image(PROJECT_ROOT, "assets/missing.png")
         with self.assertRaisesRegex(ProjectImageError, "Unsupported"):
             resolve_project_image(PROJECT_ROOT, "assets/theme.css")
+
+
+class DataframeLinkTest(unittest.TestCase):
+    def test_finds_standalone_dataframe_link(self) -> None:
+        result = find_standalone_dataframes(
+            "# Results\n\n[dataframe](data/metrics.csv)\n\nAfter.\n"
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].target, "data/metrics.csv")
+        self.assertEqual(result[0].columns, {})
+        self.assertIsNone(result[0].annotation_error)
+        self.assertEqual((result[0].start_line, result[0].end_line), (2, 3))
+
+    def test_finds_dataframe_column_annotations(self) -> None:
+        result = find_standalone_dataframes(
+            "[dataframe](data/metrics.csv)\n\n"
+            "```dataframe\n"
+            "columns:\n"
+            "  foo_bar: Foo Bar\n"
+            "  asr_dwer_micro: dWER\n"
+            "```\n\n"
+            "After.\n"
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].columns, {"foo_bar": "Foo Bar", "asr_dwer_micro": "dWER"})
+        self.assertEqual((result[0].start_line, result[0].end_line), (0, 7))
+
+    def test_reports_invalid_dataframe_annotations(self) -> None:
+        result = find_standalone_dataframes("[dataframe](data/metrics.csv)\n\n```dataframe\ncolumns: nope\n```\n")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].columns, {})
+        self.assertIn("columns", result[0].annotation_error or "")
+
+    def test_ignores_non_standalone_and_non_dataframe_links(self) -> None:
+        inline = find_standalone_dataframes("See [dataframe](data/metrics.csv) inline.\n")
+        ordinary = find_standalone_dataframes("[metrics](data/metrics.csv)\n")
+        external = find_standalone_dataframes("[dataframe](https://example.com/metrics.csv)\n")
+
+        self.assertEqual(inline, ())
+        self.assertEqual(ordinary, ())
+        self.assertEqual(external, ())
+
+    def test_resolves_project_csv(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            (project_root / "data").mkdir()
+            csv_path = project_root / "data" / "metrics.csv"
+            csv_path.write_text("epoch,loss\n1,0.5\n", encoding="utf-8")
+
+            expected = csv_path.resolve()
+            result = resolve_project_dataframe(project_root, "data/metrics.csv")
+
+            self.assertEqual(result, expected)
+
+    def test_rejects_missing_unsupported_and_outside_dataframes(self) -> None:
+        with self.assertRaisesRegex(ProjectDataframeError, "Unsupported"):
+            resolve_project_dataframe(PROJECT_ROOT, "README.md")
+        with self.assertRaisesRegex(ProjectDataframeError, "not found"):
+            resolve_project_dataframe(PROJECT_ROOT, "missing.csv")
+        with self.assertRaisesRegex(ProjectDataframeError, "inside the project"):
+            resolve_project_dataframe(PROJECT_ROOT, "../outside.csv")
 
 
 class MarkdownTableTest(unittest.TestCase):

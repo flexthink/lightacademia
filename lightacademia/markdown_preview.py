@@ -6,9 +6,11 @@ from urllib.parse import unquote, urlencode, urlsplit
 
 from markdown_it import MarkdownIt
 from tabulate import tabulate
+import yaml
 
 
 SUPPORTED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+SUPPORTED_DATAFRAME_SUFFIXES = {".csv"}
 
 
 class ProjectImageError(ValueError):
@@ -16,6 +18,10 @@ class ProjectImageError(ValueError):
 
 
 class ProjectNoteLinkError(ValueError):
+    pass
+
+
+class ProjectDataframeError(ValueError):
     pass
 
 
@@ -40,6 +46,15 @@ class MarkdownTable:
     source: str
     copy_text: str
     latex_text: str
+
+
+@dataclass(frozen=True)
+class MarkdownDataframe:
+    start_line: int
+    end_line: int
+    target: str
+    columns: dict[str, str]
+    annotation_error: str | None = None
 
 
 _MARKDOWN = MarkdownIt("commonmark")
@@ -213,7 +228,7 @@ def resolve_project_image(project_dir: Path, target: str) -> Path:
     if parsed.scheme or parsed.netloc or not parsed.path:
         raise ProjectImageError("Image link must be a project-relative path.")
 
-    relative_path = Path(unquote(parsed.path))
+    relative_path = Path(unquote(parsed.path).removeprefix("./"))
     if relative_path.is_absolute():
         raise ProjectImageError("Image link must be relative to the project.")
 
@@ -226,6 +241,122 @@ def resolve_project_image(project_dir: Path, target: str) -> Path:
     if not image_path.is_file():
         raise ProjectImageError(f"Image not found: `{relative_path}`.")
     return image_path
+
+
+def find_standalone_dataframes(markdown: str) -> tuple[MarkdownDataframe, ...]:
+    tokens = _MARKDOWN.parse(markdown)
+    dataframes: list[MarkdownDataframe] = []
+
+    index = 0
+    while index < len(tokens) - 2:
+        opening, inline, closing = tokens[index : index + 3]
+        if (
+            opening.type != "paragraph_open"
+            or inline.type != "inline"
+            or closing.type != "paragraph_close"
+            or opening.map is None
+            or opening.level != 0
+        ):
+            index += 1
+            continue
+
+        children = [
+            child
+            for child in (inline.children or [])
+            if child.type != "text" or child.content.strip()
+        ]
+        if len(children) != 3:
+            index += 1
+            continue
+        link_open, label, link_close = children
+        if link_open.type != "link_open" or label.type != "text" or link_close.type != "link_close":
+            index += 1
+            continue
+        if label.content.strip().lower() != "dataframe":
+            index += 1
+            continue
+
+        target = link_open.attrGet("href") or ""
+        if not is_local_dataframe_target(target):
+            index += 1
+            continue
+
+        end_line = opening.map[1]
+        columns: dict[str, str] = {}
+        annotation_error = None
+        annotation_index = index + 3
+        if annotation_index < len(tokens) and _is_dataframe_annotation_fence(tokens[annotation_index]):
+            annotation = tokens[annotation_index]
+            columns, annotation_error = parse_dataframe_annotation(annotation.content)
+            if annotation.map is not None:
+                end_line = annotation.map[1]
+
+        dataframes.append(
+            MarkdownDataframe(
+                start_line=opening.map[0],
+                end_line=end_line,
+                target=target,
+                columns=columns,
+                annotation_error=annotation_error,
+            )
+        )
+        if annotation_index < len(tokens) and _is_dataframe_annotation_fence(tokens[annotation_index]):
+            index = annotation_index + 1
+        else:
+            index += 3
+
+    return tuple(dataframes)
+
+
+def _is_dataframe_annotation_fence(token) -> bool:
+    if token.type != "fence":
+        return False
+    return token.info.strip().split(maxsplit=1)[0:1] == ["dataframe"]
+
+
+def parse_dataframe_annotation(content: str) -> tuple[dict[str, str], str | None]:
+    try:
+        annotation = yaml.safe_load(content) or {}
+    except yaml.YAMLError as exc:
+        return {}, f"Could not parse dataframe annotation: {exc}"
+    if not isinstance(annotation, dict):
+        return {}, "Dataframe annotation must be a YAML mapping."
+
+    columns = annotation.get("columns", {})
+    if columns is None:
+        return {}, None
+    if not isinstance(columns, dict):
+        return {}, "Dataframe annotation `columns` must be a YAML mapping."
+    return {str(source): str(label) for source, label in columns.items()}, None
+
+
+def is_local_dataframe_target(target: str) -> bool:
+    parsed = urlsplit(target)
+    return (
+        bool(parsed.path)
+        and not parsed.scheme
+        and not parsed.netloc
+        and Path(unquote(parsed.path)).suffix.lower() in SUPPORTED_DATAFRAME_SUFFIXES
+    )
+
+
+def resolve_project_dataframe(project_dir: Path, target: str) -> Path:
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or not parsed.path:
+        raise ProjectDataframeError("Dataframe link must be a project-relative path.")
+
+    relative_path = Path(unquote(parsed.path).removeprefix("./"))
+    if relative_path.is_absolute():
+        raise ProjectDataframeError("Dataframe link must be relative to the project.")
+
+    dataframe_path = (project_dir / relative_path).resolve()
+    if not dataframe_path.is_relative_to(project_dir.resolve()):
+        raise ProjectDataframeError("Dataframe link must stay inside the project.")
+    if dataframe_path.suffix.lower() not in SUPPORTED_DATAFRAME_SUFFIXES:
+        raise ProjectDataframeError(f"Unsupported dataframe type: `{dataframe_path.suffix or 'none'}`.")
+    if not dataframe_path.is_file():
+        raise ProjectDataframeError(f"Dataframe not found: `{relative_path}`.")
+    return dataframe_path
 
 
 def find_markdown_tables(markdown: str) -> tuple[MarkdownTable, ...]:

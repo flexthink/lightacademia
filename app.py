@@ -19,6 +19,7 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 import streamlit_extras.resizable_columns as resizable_columns_module
 from streamlit.components.v2.get_bidi_component_manager import get_bidi_component_manager
@@ -47,9 +48,12 @@ from lightacademia.git_ops import (
     git_sync,
 )
 from lightacademia.markdown_preview import (
+    ProjectDataframeError,
     ProjectImageError,
     find_markdown_tables,
+    find_standalone_dataframes,
     find_standalone_images,
+    resolve_project_dataframe,
     resolve_project_image,
     rewrite_project_note_links,
 )
@@ -460,6 +464,31 @@ def add_image_dialog(project: Project, note) -> None:
             st.error(f"Could not add image: {exc}")
 
 
+@st.dialog("Add link", icon=":material/link:")
+def add_link_dialog(project: Project, note) -> None:
+    notes = [candidate for candidate in list_notes(project) if candidate.name != note.name]
+    if not notes:
+        st.info("No other notes to link to.")
+        return
+
+    options = [candidate.name for candidate in notes]
+    target_note_name = st.selectbox(
+        "Page",
+        options=options,
+        format_func=note_display_name,
+        key=f"link_target_{project.name}_{note.name}",
+    )
+    if st.button("Add link", type="primary", icon=":material/link:"):
+        try:
+            save_editor_state(note)
+            link_markdown = f"[{note_display_name(target_note_name)}]({target_note_name})"
+            insert_markdown_at_editor_cursor(note, link_markdown)
+            st.session_state.source_visible = True
+            st.rerun()
+        except OSError as exc:
+            st.error(f"Could not add link: {exc}")
+
+
 @st.dialog("Note history", icon=":material/history:")
 def note_history_dialog(project: Project, note) -> None:
     save_editor_state(note)
@@ -857,6 +886,10 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
         for image in find_standalone_images(markdown)
     )
     events.extend(
+        (dataframe.start_line, dataframe.end_line, "dataframe", dataframe)
+        for dataframe in find_standalone_dataframes(markdown)
+    )
+    events.extend(
         (table.start_line, table.end_line, "table", table)
         for table in find_markdown_tables(markdown)
     )
@@ -892,6 +925,18 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
             else:
                 render_copyable_image(image_path, event.alt, source_key, start_line)
                 st.image(image_path, caption=event.alt or None, width="stretch")
+        elif event_type == "dataframe":
+            try:
+                dataframe_path = resolve_project_dataframe(project_dir, event.target)
+            except ProjectDataframeError as exc:
+                st.warning(str(exc))
+            else:
+                render_project_dataframe(
+                    dataframe_path,
+                    project_dir,
+                    columns=event.columns,
+                    annotation_error=event.annotation_error,
+                )
         else:
             table_markdown = "".join(lines[start_line:end_line])
             render_copyable_table(table_markdown, event.copy_text, event.latex_text, source_key, start_line)
@@ -914,6 +959,27 @@ def render_copyable_table(table_markdown: str, copy_text: str, latex_text: str, 
         height=42,
     )
     st.markdown(table_markdown)
+
+
+def render_project_dataframe(
+    dataframe_path: Path,
+    project_dir: Path,
+    columns: dict[str, str] | None = None,
+    annotation_error: str | None = None,
+) -> None:
+    project_root = project_dir.resolve()
+    relative_path = dataframe_path.resolve().relative_to(project_root)
+    try:
+        dataframe = pd.read_csv(dataframe_path)
+    except Exception as exc:
+        st.warning(f"Could not read dataframe `{relative_path}`: {exc}")
+        return
+    if columns:
+        dataframe = dataframe.rename(columns=columns)
+    if annotation_error:
+        st.warning(annotation_error)
+    st.caption(str(relative_path))
+    st.dataframe(dataframe, width="stretch", height=360)
 
 
 def render_copyable_image(image_path: Path, alt: str, source_key: str, start_line: int) -> None:
@@ -1405,6 +1471,14 @@ def main() -> None:
                 disabled=is_history_view,
             ):
                 add_image_dialog(project, note)
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_add_link",
+                help="Add link",
+                icon=":material/link:",
+                disabled=is_history_view,
+            ):
+                add_link_dialog(project, note)
             if st.button(
                 ICON_BUTTON_LABEL,
                 key="sync_project",

@@ -11,6 +11,15 @@ Rules:
 - Update files only inside the selected project root.
 - Use the project `data/` directory for logs, training job outputs, exported metrics, query results, CSV or JSON summaries, and lightweight tables.
 - Do not use `data/` for raw datasets or full dataset management.
+- When a CSV should be shown as an interactive table in Light Academia, reference it from Markdown with a project-relative dataframe link such as `[dataframe](data/metrics.csv)`.
+- Keep dataframe CSV files inside the selected project, usually under `data/`; plain Markdown readers will show the dataframe syntax as a normal link.
+- To show friendlier dataframe column names, place an optional fenced `dataframe` YAML block immediately after the link:
+  ```dataframe
+  columns:
+    raw_column_name: Friendly Name
+    asr_dwer_micro: dWER
+  ```
+  Only use this for display labels; do not modify the CSV headers just to make them pretty.
 - Use the project `assets/` directory for generated images referenced by Markdown notes.
 - Reference project images with project-relative Markdown paths such as `![Caption](assets/plot.png)`.
 - Use the project `code/` directory for scratch scripts that fetch, parse, summarize, tabulate, or plot project artifacts.
