@@ -6,9 +6,11 @@ import hashlib
 import html
 import importlib.metadata
 import inspect
+import json
 import logging
 import mimetypes
 import queue
+import re
 import threading
 import time
 import uuid
@@ -66,6 +68,8 @@ from lightacademia.storage import (
     read_note,
     rename_note,
     save_note,
+    slugify,
+    unique_child_path,
 )
 
 logging.basicConfig(
@@ -378,18 +382,28 @@ def archive_project_dialog(notebook_dir: Path, project: Project, current_note_to
 
 
 @st.dialog("Settings", icon=":material/settings:")
-def settings_dialog(project: Project) -> None:
+def settings_dialog(project: Project, note) -> None:
+    note_title = st.text_input("Name", value=note.path.stem, key=f"settings_note_name_{project.name}_{note.name}")
     current_remote = git_remote_url(project.path) or ""
     remote_url = st.text_input("Remote URL", value=current_remote, key=f"remote_url_{project.name}")
     st.caption("Leave empty and save to remove the configured remote.")
     if st.button("Save", type="primary", icon=":material/save:"):
+        if not note_title.strip():
+            st.warning("Enter a note name.")
+            return
         try:
+            if note_title.strip() != note.path.stem:
+                save_editor_state(note)
+                renamed = rename_note(project, note, note_title)
+                st.session_state.note_name = renamed.name
+                set_selection_query(project.name, renamed.name)
+                st.session_state.editor_revision += 1
             git_set_remote_url(project.path, remote_url)
             st.session_state.last_sync_error = None
-            st.session_state.last_sync_message = "Remote settings saved."
+            st.session_state.last_sync_message = "Settings saved."
             st.rerun()
-        except GitError as exc:
-            st.error(f"Could not save remote URL: {exc}")
+        except (OSError, GitError) as exc:
+            st.error(f"Could not save settings: {exc}")
 
 
 @st.dialog("New note", icon=":material/note_add:")
@@ -406,24 +420,6 @@ def new_note_dialog(project: Project) -> None:
         st.rerun()
 
 
-@st.dialog("Rename note", icon=":material/edit:")
-def rename_note_dialog(project: Project, note) -> None:
-    new_title = st.text_input("New title", value=note.path.stem, key=f"rename_{note.name}")
-    if st.button("Rename", type="primary", icon=":material/drive_file_rename_outline:"):
-        if not new_title.strip():
-            st.warning("Enter a note title.")
-            return
-        try:
-            save_editor_state(note)
-            renamed = rename_note(project, note, new_title)
-            st.session_state.note_name = renamed.name
-            set_selection_query(project.name, renamed.name)
-            st.session_state.editor_revision += 1
-            st.rerun()
-        except (OSError, GitError) as exc:
-            st.error(f"Could not rename note: {exc}")
-
-
 @st.dialog("Archive note", icon=":material/archive:")
 def archive_note_dialog(project: Project, note) -> None:
     st.write(f"Archive `{note.name}`?")
@@ -437,6 +433,31 @@ def archive_note_dialog(project: Project, note) -> None:
             st.rerun()
         except (OSError, GitError) as exc:
             st.error(f"Could not archive note: {exc}")
+
+
+@st.dialog("Add image", icon=":material/add_photo_alternate:")
+def add_image_dialog(project: Project, note) -> None:
+    uploaded = st.file_uploader(
+        "Image",
+        type=["png", "jpg", "jpeg", "gif", "webp", "svg"],
+        key=f"upload_image_{project.name}_{note.name}",
+    )
+    alt_text = st.text_input("Alt text", key=f"upload_image_alt_{project.name}_{note.name}")
+    if st.button("Add image", type="primary", icon=":material/add_photo_alternate:"):
+        if uploaded is None:
+            st.warning("Choose an image.")
+            return
+        try:
+            save_editor_state(note)
+            asset_path = save_uploaded_project_image(project, uploaded.name, uploaded.getvalue())
+            relative_path = asset_path.relative_to(project.path).as_posix()
+            alt = alt_text.strip() or asset_path.stem.replace("-", " ").replace("_", " ")
+            image_markdown = f"![{alt}]({relative_path})"
+            insert_markdown_at_editor_cursor(note, image_markdown)
+            st.session_state.source_visible = True
+            st.rerun()
+        except OSError as exc:
+            st.error(f"Could not add image: {exc}")
 
 
 @st.dialog("Note history", icon=":material/history:")
@@ -514,6 +535,7 @@ def init_state() -> None:
         "agent_progress_chars": 0,
         "requested_action": None,
         "source_visible": False,
+        "editor_cursors": {},
         "history_revision": None,
         "history_note_name": None,
         "history_label": None,
@@ -638,6 +660,93 @@ def save_editor_state(note) -> bool:
     return True
 
 
+def save_uploaded_project_image(project: Project, filename: str, content: bytes) -> Path:
+    assets_dir = project.path / "assets"
+    assets_dir.mkdir(exist_ok=True)
+    source_name = Path(filename or "image").name
+    suffix = Path(source_name).suffix.lower()
+    if suffix not in {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}:
+        suffix = ".png"
+    stem = slugify(Path(source_name).stem, "image")
+    target = unique_child_path(assets_dir, stem, suffix)
+    target.write_bytes(content)
+    return target
+
+
+def current_editor_content(note) -> str:
+    value = st.session_state.get(editor_key(note))
+    if isinstance(value, dict):
+        value = value.get("text")
+    return value if isinstance(value, str) else read_note(note)
+
+
+def insert_markdown_at_editor_cursor(note, snippet: str) -> None:
+    content = current_editor_content(note)
+    cursor = st.session_state.get("editor_cursors", {}).get(note.name)
+    offset = cursor_to_offset(content, cursor)
+    insertion = format_snippet_insertion(content, snippet, offset)
+    updated = f"{content[:offset]}{insertion}{content[offset:]}"
+    save_note(note, updated)
+    st.session_state.last_edit_at = time.time()
+    st.session_state.editor_revision += 1
+
+
+def format_snippet_insertion(content: str, snippet: str, offset: int) -> str:
+    prefix = "" if offset == 0 or content[offset - 1] == "\n" else "\n\n"
+    suffix = "" if offset >= len(content) or content[offset : offset + 1] == "\n" else "\n\n"
+    return f"{prefix}{snippet}{suffix}"
+
+
+def cursor_to_offset(content: str, cursor) -> int:
+    parsed = parse_editor_cursor(cursor)
+    if isinstance(parsed, int):
+        return max(0, min(len(content), parsed))
+    if isinstance(parsed, dict):
+        row = parsed.get("row", parsed.get("line"))
+        column = parsed.get("column", parsed.get("col"))
+        if isinstance(row, int) and isinstance(column, int):
+            return row_column_to_offset(content, row, column)
+    return len(content)
+
+
+def parse_editor_cursor(cursor):
+    if isinstance(cursor, str):
+        stripped = cursor.strip()
+        if not stripped:
+            return None
+        if stripped.isdigit():
+            return int(stripped)
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            match = re.search(r"row['\"]?\s*:\s*(\d+).*column['\"]?\s*:\s*(\d+)", stripped)
+            if match:
+                return {"row": int(match.group(1)), "column": int(match.group(2))}
+            return None
+    if isinstance(cursor, dict) and isinstance(cursor.get("start"), dict):
+        return cursor["start"]
+    return cursor
+
+
+def row_column_to_offset(content: str, row: int, column: int) -> int:
+    if row <= 0:
+        return max(0, min(len(content), column))
+    lines = content.splitlines(keepends=True)
+    if row >= len(lines):
+        return len(content)
+    return sum(len(line) for line in lines[:row]) + max(0, min(len(lines[row]), column))
+
+
+def remember_editor_cursor(note, response) -> None:
+    if not isinstance(response, dict):
+        return
+    cursor = response.get("cursor")
+    if cursor in (None, ""):
+        return
+    cursors = st.session_state.setdefault("editor_cursors", {})
+    cursors[note.name] = cursor
+
+
 def editor_response_content(response, fallback: str) -> str:
     if not isinstance(response, dict):
         return fallback
@@ -679,12 +788,13 @@ def render_editor(note) -> str:
             content,
             lang="markdown",
             theme="streamlit_light",
-            height=[20, 24],
+            height=[34, 34],
             key=key,
             response_mode=["debounce", "blur"],
             options={"wrap": True, "fontSize": 14},
             component_props={"css": EDITOR_COMPONENT_CSS},
         )
+        remember_editor_cursor(note, response)
         return editor_response_content(response, content)
     return st.text_area("Markdown", value=content, height=note_pane_height(), key=key, label_visibility="collapsed")
 
@@ -1237,14 +1347,6 @@ def main() -> None:
             gap="small",
         ):
             render_note_header_title(note.name)
-            if st.button(
-                ICON_BUTTON_LABEL,
-                key="open_rename_note",
-                help="Rename note",
-                icon=":material/drive_file_rename_outline:",
-                disabled=is_history_view,
-            ):
-                rename_note_dialog(project, note)
     with spacer_col:
         st.write("")
     with actions_col:
@@ -1294,7 +1396,15 @@ def main() -> None:
                 help="Settings",
                 icon=":material/settings:",
             ):
-                settings_dialog(project)
+                settings_dialog(project, note)
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_add_image",
+                help="Add image",
+                icon=":material/add_photo_alternate:",
+                disabled=is_history_view,
+            ):
+                add_image_dialog(project, note)
             if st.button(
                 ICON_BUTTON_LABEL,
                 key="sync_project",
@@ -1353,7 +1463,18 @@ def main() -> None:
     if st.session_state.last_agent_error:
         st.error(st.session_state.last_agent_error)
     if st.session_state.last_agent_response:
-        st.markdown(st.session_state.last_agent_response)
+        summary_col, dismiss_col = st.columns([0.94, 0.06], vertical_alignment="top")
+        with summary_col:
+            st.markdown(st.session_state.last_agent_response)
+        with dismiss_col:
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="dismiss_agent_summary",
+                help="Dismiss agent summary",
+                icon=":material/close:",
+            ):
+                st.session_state.last_agent_response = None
+                st.rerun()
 
     if not is_history_view:
         render_agent_panel(project, note, action_result.actions, tools_dir)
