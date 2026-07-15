@@ -6,14 +6,17 @@ import hashlib
 import html
 import importlib.metadata
 import inspect
+import io
 import json
 import logging
 import mimetypes
 import queue
 import re
+import shutil
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
@@ -42,10 +45,12 @@ from lightacademia.git_ops import (
     git_commit_all,
     git_file_at_revision,
     git_file_history,
+    git_init,
     git_remote_url,
     git_set_remote_url,
     git_status_lines,
     git_sync,
+    run_git,
 )
 from lightacademia.markdown_preview import (
     ProjectDataframeError,
@@ -99,9 +104,38 @@ LOGO_PATH = Path("assets/logo.png")
 THEME_CSS_PATH = Path("assets/theme.css")
 COPY_IMAGE_BUTTON_CSS_PATH = Path("assets/copy_image_button.css")
 COPY_TABLE_BUTTONS_CSS_PATH = Path("assets/copy_table_buttons.css")
+WORKSPACE_TREE_CSS_PATH = Path("assets/workspace_tree.css")
+WORKSPACE_TREE_JS_PATH = Path("assets/workspace_tree.js")
 PROJECT_QUERY_PARAM = "project"
 NOTE_QUERY_PARAM = "note"
 RESIZABLE_COLUMNS_COMPONENT = "streamlit-extras.resizable_columns"
+MARKDOWN_SUFFIXES = {".md", ".markdown"}
+TEXT_SUFFIXES = {
+    ".bash",
+    ".cfg",
+    ".conf",
+    ".css",
+    ".csv",
+    ".env",
+    ".ini",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".md",
+    ".markdown",
+    ".py",
+    ".r",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".txt",
+    ".yaml",
+    ".yml",
+    ".zsh",
+}
 COPY_IMAGE_BUTTON_HTML = '<button type="button" class="la-copy-image-button">📋 Copy image</button>'
 COPY_IMAGE_BUTTON_JS = """
 export default function(component) {
@@ -162,6 +196,7 @@ export default function(component) {
   });
 }
 """
+WORKSPACE_TREE_HTML = '<div class="la-workspace-tree" role="tree"></div>'
 EDITOR_COMPONENT_CSS = """
 :root {
   --streamlit-light-background-color: #fffaf1;
@@ -247,6 +282,36 @@ def copy_table_buttons_component():
 
 
 @lru_cache(maxsize=1)
+def workspace_tree_component():
+    css = WORKSPACE_TREE_CSS_PATH.read_text(encoding="utf-8") if WORKSPACE_TREE_CSS_PATH.exists() else ""
+    js = WORKSPACE_TREE_JS_PATH.read_text(encoding="utf-8") if WORKSPACE_TREE_JS_PATH.exists() else ""
+    return st.components.v2.component(
+        "light_academia_workspace_tree",
+        html=WORKSPACE_TREE_HTML,
+        css=css,
+        js=js,
+    )
+
+
+def workspace_tree_selection(
+    tree: dict[str, object],
+    selected: str | None,
+    key: str,
+    tree_id: str,
+) -> str | None:
+    result = workspace_tree_component()(
+        key=key,
+        data={"tree": tree, "selected": selected or "", "expandedDepth": 2, "treeId": tree_id},
+        default={"selected": selected or ""},
+        on_selected_change=lambda: None,
+    )
+    if not isinstance(result, dict):
+        return selected
+    value = result.get("selected")
+    return value if isinstance(value, str) and value else selected
+
+
+@lru_cache(maxsize=1)
 def logo_data_uri() -> str | None:
     if not LOGO_PATH.exists():
         return None
@@ -309,6 +374,7 @@ class AppConfig:
     tools_dir: Path
     autocommit_seconds: int
     agent: str
+    agent_timeout_seconds: int
 
 
 @dataclass
@@ -319,6 +385,7 @@ class AgentRunState:
     prompt: str
     tools_dir: Path
     agent: str
+    agent_timeout_seconds: int
     before_status: set[str]
     progress: queue.Queue[AgentProgress]
     stop_requested: threading.Event
@@ -327,6 +394,12 @@ class AgentRunState:
     response_message: str | None = None
     error: BaseException | None = None
     done: bool = False
+
+
+@dataclass(frozen=True)
+class ToolDocument:
+    name: str
+    path: Path
 
 
 @st.cache_resource
@@ -341,12 +414,14 @@ def get_config() -> AppConfig:
     parser.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--autocommit-seconds", type=int, default=DEFAULT_AUTOCOMMIT_SECONDS)
     parser.add_argument("--agent", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--agent-timeout-seconds", type=int, default=3600)
     args, _ = parser.parse_known_args()
     return AppConfig(
         notebook_dir=args.notebook.expanduser(),
         tools_dir=args.tools.expanduser(),
         autocommit_seconds=max(30, args.autocommit_seconds),
         agent=args.agent,
+        agent_timeout_seconds=max(60, args.agent_timeout_seconds),
     )
 
 
@@ -519,6 +594,181 @@ def note_history_dialog(project: Project, note) -> None:
                 st.rerun()
 
 
+@st.dialog("Tool history", icon=":material/history:")
+def tool_history_dialog(tools_dir: Path, path: Path) -> None:
+    save_tool_editor_state(path)
+    checkpoint_tools(tools_dir, "Checkpoint before viewing tool history")
+    try:
+        revisions = git_file_history(tools_dir.resolve(), path.resolve())
+    except GitError as exc:
+        st.error(f"Could not read tool history: {exc}")
+        return
+
+    if not revisions:
+        st.info("No history for this tool file yet.")
+        return
+
+    relative_path = path.resolve().relative_to(tools_dir.resolve()).as_posix()
+    for revision in revisions:
+        label_col, button_col = st.columns([0.78, 0.22], vertical_alignment="center")
+        with label_col:
+            st.markdown(history_entry_label(revision))
+        with button_col:
+            if st.button(
+                "View",
+                key=f"view_tool_history_{relative_path}_{revision.commit}",
+                icon=":material/visibility:",
+            ):
+                st.session_state.tool_history_revision = revision.commit
+                st.session_state.tool_history_path = relative_path
+                st.session_state.tool_history_label = history_entry_label(revision)
+                st.rerun()
+
+
+@st.dialog("Import tools", icon=":material/upload_file:")
+def import_tools_dialog(tools_dir: Path) -> None:
+    uploaded = st.file_uploader(
+        "Tools zip",
+        type=["zip"],
+        key=f"import_tools_zip_{tools_dir.resolve()}",
+    )
+    st.caption("Files from the zip are written into tools/. Existing paths are overwritten. Git history is kept.")
+    if st.button("Import", type="primary", icon=":material/upload_file:"):
+        if uploaded is None:
+            st.warning("Choose a zip file.")
+            return
+        try:
+            save_selected_tool_editor_state(tools_dir)
+            checkpoint_tools(tools_dir, "Checkpoint before importing tools")
+            imported = import_tools_zip(tools_dir, uploaded.getvalue())
+            checkpoint_tools(tools_dir, "Import tools")
+            clear_tool_history_revision()
+            st.session_state.tool_editor_revision += 1
+            st.session_state.workspace_tree_revision += 1
+            st.session_state.tools_import_message = f"Imported {imported} files."
+            st.rerun(scope="app")
+        except zipfile.BadZipFile:
+            st.error("The uploaded file is not a valid zip archive.")
+        except (OSError, GitError) as exc:
+            st.error(f"Could not import tools: {exc}")
+
+
+@st.dialog("New tools folder", icon=":material/create_new_folder:")
+def new_tool_folder_dialog(tools_dir: Path) -> None:
+    parent_options = tool_parent_options(tools_dir)
+    parent = st.selectbox(
+        "Location",
+        parent_options,
+        index=tool_parent_default_index(tools_dir, parent_options),
+        format_func=tool_parent_label,
+        key="new_tool_folder_parent",
+    )
+    name = st.text_input("Folder name", key="new_tool_folder_name")
+    if st.button("Create", type="primary", icon=":material/create_new_folder:"):
+        error = validate_tool_entry_name(name)
+        if error:
+            st.warning(error)
+            return
+        target = tools_dir.resolve() / parent / name.strip()
+        if target.exists():
+            st.warning("A file or folder with that name already exists.")
+            return
+        try:
+            save_selected_tool_editor_state(tools_dir)
+            checkpoint_tools(tools_dir, "Checkpoint before creating tool folder")
+            target.mkdir()
+            marker = target / ".gitkeep"
+            marker.write_text("", encoding="utf-8")
+            run_git(
+                tools_dir.resolve(),
+                "add",
+                "--",
+                marker.relative_to(tools_dir.resolve()).as_posix(),
+            )
+            checkpoint_tools(tools_dir, f"Create tools folder {target.relative_to(tools_dir.resolve()).as_posix()}")
+            relative_target = target.relative_to(tools_dir.resolve()).as_posix()
+            st.session_state.selected_tool_path = relative_target
+            refresh_tools_view(f"Created folder {relative_target}.")
+        except (OSError, GitError) as exc:
+            st.error(f"Could not create folder: {exc}")
+
+
+@st.dialog("New tool file", icon=":material/note_add:")
+def new_tool_file_dialog(tools_dir: Path) -> None:
+    parent_options = tool_parent_options(tools_dir)
+    parent = st.selectbox(
+        "Location",
+        parent_options,
+        index=tool_parent_default_index(tools_dir, parent_options),
+        format_func=tool_parent_label,
+        key="new_tool_file_parent",
+    )
+    name = st.text_input("File name", placeholder="example.py", key="new_tool_file_name")
+    st.caption("Only text and code files can be created. Syntax highlighting follows the file extension.")
+    if st.button("Create", type="primary", icon=":material/note_add:"):
+        error = validate_tool_entry_name(name)
+        if error:
+            st.warning(error)
+            return
+        cleaned_name = name.strip()
+        if not is_supported_tool_filename(cleaned_name):
+            st.warning("Use a recognized text or code file extension.")
+            return
+        target = tools_dir.resolve() / parent / cleaned_name
+        if target.exists():
+            st.warning("A file or folder with that name already exists.")
+            return
+        try:
+            save_selected_tool_editor_state(tools_dir)
+            checkpoint_tools(tools_dir, "Checkpoint before creating tool file")
+            target.write_text("", encoding="utf-8")
+            marker = target.parent / ".gitkeep"
+            if marker.is_file():
+                marker.unlink()
+            checkpoint_tools(tools_dir, f"Create tool {target.relative_to(tools_dir.resolve()).as_posix()}")
+            st.session_state.selected_tool_path = target.relative_to(tools_dir.resolve()).as_posix()
+            refresh_tools_view(f"Created {st.session_state.selected_tool_path}.")
+        except (OSError, GitError) as exc:
+            st.error(f"Could not create file: {exc}")
+
+
+@st.dialog("Delete tool", icon=":material/delete:")
+def delete_tool_file_dialog(tools_dir: Path, path: Path) -> None:
+    relative_path = path.resolve().relative_to(tools_dir.resolve()).as_posix()
+    item_type = "folder and all of its contents" if path.is_dir() else "file"
+    st.warning(f"Delete the {item_type} `{relative_path}`? This cannot be undone from the current view.")
+    if st.button("Delete", type="primary", icon=":material/delete:"):
+        try:
+            if path.is_file() and is_editable_tool_file(path):
+                save_tool_editor_state(path)
+            checkpoint_tools(tools_dir, "Checkpoint before deleting tool file")
+            git_rm_args = ["rm"]
+            if path.is_dir():
+                git_rm_args.append("-r")
+            git_rm_args.extend(["--ignore-unmatch", "--", relative_path])
+            run_git(tools_dir.resolve(), *git_rm_args)
+            if path.is_dir() and path.exists():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+            if path.parent != tools_dir.resolve() and not any(path.parent.iterdir()):
+                marker = path.parent / ".gitkeep"
+                marker.write_text("", encoding="utf-8")
+                run_git(
+                    tools_dir.resolve(),
+                    "add",
+                    "--",
+                    marker.relative_to(tools_dir.resolve()).as_posix(),
+                )
+            if not checkpoint_tools(tools_dir, f"Delete tool {relative_path}"):
+                run_git(tools_dir.resolve(), "commit", "--allow-empty", "-m", f"Delete tool {relative_path}")
+            st.session_state.selected_tool_path = None
+            clear_tool_history_revision()
+            refresh_tools_view(f"Deleted {relative_path}.")
+        except (OSError, GitError) as exc:
+            st.error(f"Could not delete file: {exc}")
+
+
 @st.dialog("Agent chat history", icon=":material/forum:")
 def chat_history_dialog(project: Project) -> None:
     available_dates = list_chat_log_dates(project.path)
@@ -570,6 +820,17 @@ def init_state() -> None:
         "history_label": None,
         "last_sync_error": None,
         "last_sync_message": None,
+        "workspace_view": "notes",
+        "selected_tool_path": None,
+        "tool_editor_revision": 0,
+        "workspace_tree_revision": 0,
+        "tools_import_message": None,
+        "tools_action_message": None,
+        "tool_last_edit_at": None,
+        "tool_last_commit_at": None,
+        "tool_history_revision": None,
+        "tool_history_path": None,
+        "tool_history_label": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -632,6 +893,24 @@ def clear_history_revision() -> None:
     st.session_state.history_label = None
 
 
+def active_tool_history_revision(path: Path, tools_dir: Path) -> str | None:
+    revision = st.session_state.get("tool_history_revision")
+    history_path = st.session_state.get("tool_history_path")
+    try:
+        relative_path = path.resolve().relative_to(tools_dir.resolve()).as_posix()
+    except ValueError:
+        return None
+    if isinstance(revision, str) and history_path == relative_path:
+        return revision
+    return None
+
+
+def clear_tool_history_revision() -> None:
+    st.session_state.tool_history_revision = None
+    st.session_state.tool_history_path = None
+    st.session_state.tool_history_label = None
+
+
 def current_project(projects: list[Project]) -> Project | None:
     if not projects:
         return None
@@ -662,6 +941,128 @@ def commit_if_idle(project: Project, autocommit_seconds: int) -> None:
     if git_commit_all(project.path, "Autosave checkpoint"):
         st.session_state.last_commit_at = time.time()
         st.toast("Autosave checkpoint committed")
+
+
+def is_tools_git_candidate(path: Path, tools_dir: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        relative_parts = path.relative_to(tools_dir).parts
+    except ValueError:
+        return False
+    if ".git" in relative_parts:
+        return False
+    if not is_editable_tool_file(path):
+        return False
+    try:
+        path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return True
+
+
+def git_stage_tools_text_files(tools_dir: Path) -> None:
+    root = tools_dir.resolve()
+    run_git(root, "add", "-u")
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix().lower()):
+        if is_tools_git_candidate(path, root):
+            run_git(root, "add", "--", path.relative_to(root).as_posix())
+
+
+def git_has_staged_changes(repo_dir: Path) -> bool:
+    result = run_git(repo_dir, "diff", "--cached", "--quiet", check=False)
+    return result.returncode == 1
+
+
+def git_commit_tools_text_files(tools_dir: Path, message: str) -> bool:
+    if not (tools_dir / ".git").exists():
+        return False
+    git_stage_tools_text_files(tools_dir)
+    if not git_has_staged_changes(tools_dir):
+        return False
+    run_git(tools_dir, "commit", "-m", message)
+    return True
+
+
+def ensure_tools_git_excludes(tools_dir: Path) -> None:
+    exclude_path = tools_dir / ".git" / "info" / "exclude"
+    if not exclude_path.exists():
+        return
+    existing = exclude_path.read_text(encoding="utf-8")
+    patterns = ["__pycache__/", "*.py[cod]", ".DS_Store"]
+    missing = [pattern for pattern in patterns if pattern not in existing.splitlines()]
+    if missing:
+        suffix = "" if existing.endswith("\n") or not existing else "\n"
+        exclude_path.write_text(f"{existing}{suffix}" + "\n".join(missing) + "\n", encoding="utf-8")
+
+
+def ensure_tools_git_repo(tools_dir: Path) -> None:
+    tools_dir = tools_dir.resolve()
+    if (tools_dir / ".git").exists():
+        ensure_tools_git_excludes(tools_dir)
+        return
+    git_init(tools_dir)
+    ensure_tools_git_excludes(tools_dir)
+    git_commit_tools_text_files(tools_dir, "Create tools repo")
+
+
+def commit_tools_if_idle(tools_dir: Path, autocommit_seconds: int) -> None:
+    last_edit_at = st.session_state.get("tool_last_edit_at")
+    last_commit_at = st.session_state.get("tool_last_commit_at")
+    if not last_edit_at:
+        return
+    if last_commit_at and last_commit_at >= last_edit_at:
+        return
+    if time.time() - last_edit_at < autocommit_seconds:
+        return
+    if git_commit_tools_text_files(tools_dir, "Autosave tools checkpoint"):
+        st.session_state.tool_last_commit_at = time.time()
+        st.toast("Tools checkpoint committed")
+
+
+def create_tools_zip(tools_dir: Path) -> bytes:
+    root = tools_dir.resolve()
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix().lower()):
+            relative_path = path.relative_to(root)
+            if ".git" in relative_path.parts:
+                continue
+            if path.is_file():
+                zip_file.write(path, relative_path.as_posix())
+    return archive.getvalue()
+
+
+def safe_tools_zip_members(zip_file: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    members = []
+    for member in zip_file.infolist():
+        relative_path = Path(member.filename)
+        if member.filename.endswith("/") or member.is_dir():
+            continue
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or ".git" in relative_path.parts
+            or (relative_path.parts and re.match(r"^[A-Za-z]:$", relative_path.parts[0]))
+        ):
+            continue
+        members.append(member)
+    return members
+
+
+def import_tools_zip(tools_dir: Path, content: bytes) -> int:
+    root = tools_dir.resolve()
+    imported = 0
+    with zipfile.ZipFile(io.BytesIO(content)) as zip_file:
+        for member in safe_tools_zip_members(zip_file):
+            target = (root / member.filename).resolve()
+            if not target.is_relative_to(root):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zip_file.open(member) as source, target.open("wb") as destination:
+                destination.write(source.read())
+            imported += 1
+    return imported
 
 
 def editor_key(note) -> str:
@@ -786,6 +1187,224 @@ def editor_response_content(response, fallback: str) -> str:
     return response_text if isinstance(response_text, str) else fallback
 
 
+def is_markdown_file(path: Path) -> bool:
+    return path.suffix.lower() in MARKDOWN_SUFFIXES
+
+
+def is_editable_tool_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if path.suffix.lower() in TEXT_SUFFIXES:
+        return True
+    mime_type = mimetypes.guess_type(path.name)[0] or ""
+    return mime_type.startswith("text/")
+
+
+def is_visible_tool_path(path: Path) -> bool:
+    return not any(part.startswith(".") for part in path.parts)
+
+
+def is_supported_tool_filename(name: str) -> bool:
+    path = Path(name)
+    if not path.suffix:
+        return False
+    if path.suffix.lower() in TEXT_SUFFIXES:
+        return True
+    mime_type = mimetypes.guess_type(path.name)[0] or ""
+    return mime_type.startswith("text/")
+
+
+def tool_parent_options(tools_dir: Path) -> list[str]:
+    root = tools_dir.resolve()
+    directories = ["."]
+    directories.extend(
+        path.relative_to(root).as_posix()
+        for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix().lower())
+        if path.is_dir() and is_visible_tool_path(path.relative_to(root))
+    )
+    return directories
+
+
+def tool_parent_label(relative_path: str) -> str:
+    return "Tools root" if relative_path == "." else relative_path
+
+
+def tool_parent_default_index(tools_dir: Path, options: list[str]) -> int:
+    selected_path = resolve_tool_tree_selection(tools_dir, st.session_state.get("selected_tool_path"))
+    if selected_path is None:
+        return 0
+    parent_path = selected_path if selected_path.is_dir() else selected_path.parent
+    parent = parent_path.relative_to(tools_dir.resolve()).as_posix()
+    parent = "." if parent == "." else parent
+    return options.index(parent) if parent in options else 0
+
+
+def validate_tool_entry_name(name: str) -> str | None:
+    cleaned = name.strip()
+    if not cleaned:
+        return "Enter a name."
+    if cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
+        return "Enter a single file or folder name, without a path."
+    if cleaned.startswith("."):
+        return "Hidden file and folder names are not supported here."
+    return None
+
+
+def refresh_tools_view(message: str) -> None:
+    clear_tool_history_revision()
+    st.session_state.tool_editor_revision += 1
+    st.session_state.workspace_tree_revision += 1
+    st.session_state.tools_action_message = message
+    st.rerun(scope="app")
+
+
+def tool_file_language(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return {
+        ".bash": "sh",
+        ".c": "c",
+        ".cc": "cpp",
+        ".cpp": "cpp",
+        ".cs": "csharp",
+        ".css": "css",
+        ".csv": "text",
+        ".go": "golang",
+        ".java": "java",
+        ".js": "javascript",
+        ".json": "json",
+        ".jsonl": "json",
+        ".md": "markdown",
+        ".markdown": "markdown",
+        ".py": "python",
+        ".r": "r",
+        ".rb": "ruby",
+        ".rs": "rust",
+        ".sh": "sh",
+        ".sql": "sql",
+        ".toml": "toml",
+        ".ts": "typescript",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".zsh": "sh",
+    }.get(suffix, "text")
+
+
+def build_tools_tree(tools_dir: Path) -> dict[str, object]:
+    root = tools_dir.resolve()
+    tree: dict[str, object] = {}
+    if not root.exists():
+        return tree
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix().lower()):
+        relative_path = path.relative_to(root)
+        if not is_visible_tool_path(relative_path):
+            continue
+        relative_parts = relative_path.parts
+        cursor = tree
+        for part in relative_parts[:-1]:
+            cursor = cursor.setdefault(part, {})
+        cursor[relative_parts[-1]] = None if path.is_file() else cursor.get(relative_parts[-1], {})
+    return tree
+
+
+def resolve_tool_tree_selection(tools_dir: Path, selected: str | None) -> Path | None:
+    if not selected:
+        return None
+    root = tools_dir.resolve()
+    candidate = (root / selected).resolve()
+    if not candidate.is_relative_to(root) or not candidate.exists() or candidate == root:
+        return None
+    return candidate
+
+
+def resolve_tool_selection(tools_dir: Path, selected: str | None) -> Path | None:
+    candidate = resolve_tool_tree_selection(tools_dir, selected)
+    if candidate is None or not candidate.is_file():
+        return None
+    return candidate
+
+
+def tool_editor_key(path: Path) -> str:
+    return f"tool_editor_{path.resolve()}_{st.session_state.tool_editor_revision}"
+
+
+def read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def save_tool_file(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    st.session_state.tool_last_edit_at = time.time()
+
+
+def save_tool_editor_state(path: Path) -> bool:
+    if st.session_state.get("tool_history_revision") is not None:
+        return False
+    key = tool_editor_key(path)
+    value = st.session_state.get(key)
+    if isinstance(value, dict):
+        value = value.get("text")
+    if not isinstance(value, str):
+        return False
+    if value == read_text_file(path):
+        return False
+    save_tool_file(path, value)
+    return True
+
+
+def save_selected_tool_editor_state(tools_dir: Path) -> None:
+    selected_tool = resolve_tool_selection(tools_dir, st.session_state.get("selected_tool_path"))
+    if selected_tool is not None and is_editable_tool_file(selected_tool):
+        save_tool_editor_state(selected_tool)
+
+
+def checkpoint_tools(tools_dir: Path, message: str = "Tools checkpoint") -> bool:
+    if git_commit_tools_text_files(tools_dir, message):
+        st.session_state.tool_last_commit_at = time.time()
+        return True
+    return False
+
+
+def render_tool_code_editor(path: Path) -> str:
+    content = read_text_file(path)
+    key = tool_editor_key(path)
+    if code_editor is not None:
+        response = code_editor(
+            content,
+            lang=tool_file_language(path),
+            theme="streamlit_light",
+            height=[34, 34],
+            key=key,
+            response_mode=["debounce", "blur"],
+            options={"wrap": True, "fontSize": 14},
+            component_props={"css": EDITOR_COMPONENT_CSS},
+        )
+        return editor_response_content(response, content)
+    return st.text_area("File", value=content, height=note_pane_height(), key=key, label_visibility="collapsed")
+
+
+def render_tool_download_card(path: Path, tools_dir: Path) -> None:
+    relative_path = path.relative_to(tools_dir.resolve()).as_posix()
+    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    try:
+        size_bytes = path.stat().st_size
+        file_bytes = path.read_bytes()
+    except OSError as exc:
+        st.error(f"Could not read tool file: {exc}")
+        return
+
+    with st.container(border=True):
+        st.markdown(f"**{html.escape(path.name)}**")
+        st.caption(f"{relative_path} · {mime_type} · {size_bytes:,} bytes")
+        st.download_button(
+            "Download",
+            data=file_bytes,
+            file_name=path.name,
+            mime=mime_type,
+            key=f"download_selected_tool_{relative_path}",
+            icon=":material/download:",
+        )
+
+
 def commit_before_navigation(
     project: Project,
     current_note_to_save=None,
@@ -826,6 +1445,185 @@ def render_editor(note) -> str:
         remember_editor_cursor(note, response)
         return editor_response_content(response, content)
     return st.text_area("Markdown", value=content, height=note_pane_height(), key=key, label_visibility="collapsed")
+
+
+def render_tools_sidebar(tools_dir: Path) -> None:
+    import_message = st.session_state.pop("tools_import_message", None)
+    if import_message:
+        st.success(import_message)
+    action_message = st.session_state.pop("tools_action_message", None)
+    if action_message:
+        st.success(action_message)
+
+    if st.button("Notes", key="show_notes_view", icon=":material/sticky_note_2:", width="stretch"):
+        save_selected_tool_editor_state(tools_dir)
+        checkpoint_tools(tools_dir, "Checkpoint before leaving tools")
+        st.session_state.workspace_view = "notes"
+        st.rerun()
+
+    selected_path = resolve_tool_tree_selection(tools_dir, st.session_state.get("selected_tool_path"))
+    create_delete_cols = st.columns(3)
+    with create_delete_cols[0]:
+        if st.button(
+            ICON_BUTTON_LABEL,
+            key="open_new_tool_folder",
+            help="New folder",
+            icon=":material/create_new_folder:",
+            width="stretch",
+        ):
+            new_tool_folder_dialog(tools_dir)
+    with create_delete_cols[1]:
+        if st.button(
+            ICON_BUTTON_LABEL,
+            key="open_new_tool_file",
+            help="New file",
+            icon=":material/note_add:",
+            width="stretch",
+        ):
+            new_tool_file_dialog(tools_dir)
+    with create_delete_cols[2]:
+        if st.button(
+            ICON_BUTTON_LABEL,
+            key="open_delete_tool_file",
+            help="Delete file or folder",
+            icon=":material/delete:",
+            width="stretch",
+            disabled=selected_path is None,
+        ) and selected_path is not None:
+            delete_tool_file_dialog(tools_dir, selected_path)
+
+    st.markdown("### Tools")
+    tree = build_tools_tree(tools_dir)
+    if tree:
+        current_selected = st.session_state.get("selected_tool_path")
+        selected = workspace_tree_selection(
+            tree,
+            current_selected,
+            key=f"workspace_tree_{tools_dir.resolve()}_{st.session_state.workspace_tree_revision}",
+            tree_id=f"tools:{tools_dir.resolve()}",
+        )
+        if selected:
+            selected_path = resolve_tool_tree_selection(tools_dir, selected)
+            if selected_path is not None and selected != current_selected:
+                save_selected_tool_editor_state(tools_dir)
+                checkpoint_tools(tools_dir, "Checkpoint before switching tools")
+                st.session_state.selected_tool_path = selected
+                clear_tool_history_revision()
+                st.session_state.tool_editor_revision += 1
+                st.rerun()
+    else:
+        st.caption("No tool files.")
+
+    st.divider()
+    st.markdown("#### Import / Export")
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if st.button(
+            "Import",
+            key="open_import_tools",
+            help="Import tools",
+            icon=":material/upload_file:",
+            width="stretch",
+        ):
+            import_tools_dialog(tools_dir)
+    with action_cols[1]:
+        save_selected_tool_editor_state(tools_dir)
+        st.download_button(
+            "Export",
+            data=create_tools_zip(tools_dir),
+            file_name="tools.zip",
+            mime="application/zip",
+            key="export_tools",
+            help="Export tools",
+            icon=":material/download:",
+            width="stretch",
+        )
+
+
+def render_tools_workspace(tools_dir: Path) -> None:
+    selected_path = resolve_tool_tree_selection(tools_dir, st.session_state.get("selected_tool_path"))
+    if selected_path is None:
+        st.session_state.selected_tool_path = None
+        render_app_header("Tools")
+        st.info("Select a tool file or folder from the sidebar.")
+        return
+
+    relative_path = selected_path.relative_to(tools_dir.resolve()).as_posix()
+    if selected_path.is_dir():
+        render_app_header(relative_path)
+        st.info("Folder selected. Create a file inside it or use the sidebar delete button to remove it recursively.")
+        return
+
+    history_revision = active_tool_history_revision(selected_path, tools_dir)
+    is_history_view = history_revision is not None
+    brand_col, title_col, actions_col = st.columns([0.28, 0.52, 0.20], vertical_alignment="center")
+    with brand_col:
+        render_app_header()
+    with title_col:
+        st.markdown(
+            f'<div class="la-current-note">{html.escape(relative_path)}</div>',
+            unsafe_allow_html=True,
+        )
+    with actions_col:
+        with st.container(
+            key="tool_header_actions",
+            horizontal=True,
+            vertical_alignment="center",
+            gap="small",
+        ):
+            if is_history_view:
+                if st.button("Current", key="return_current_tool", icon=":material/history_toggle_off:"):
+                    clear_tool_history_revision()
+                    st.rerun()
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_tool_history",
+                help="History",
+                icon=":material/history:",
+                disabled=not is_editable_tool_file(selected_path),
+            ):
+                tool_history_dialog(tools_dir, selected_path)
+
+    if is_history_view:
+        try:
+            historical_content = git_file_at_revision(tools_dir.resolve(), selected_path.resolve(), history_revision)
+        except GitError as exc:
+            st.error(f"Could not read historical tool revision: {exc}")
+            clear_tool_history_revision()
+            st.rerun()
+        st.markdown(
+            f'<div class="la-history-badge">Historical view · {html.escape(str(st.session_state.get("tool_history_label") or history_revision[:7]))}</div>',
+            unsafe_allow_html=True,
+        )
+        if is_markdown_file(selected_path):
+            pseudo_project = Project("tools", tools_dir.resolve())
+            pseudo_note = ToolDocument(selected_path.name, selected_path)
+            render_preview(pseudo_project, pseudo_note, historical_content, allow_actions=False, source_suffix=f":tools:{history_revision}")
+        else:
+            st.code(historical_content, language=tool_file_language(selected_path))
+        return
+
+    try:
+        if is_markdown_file(selected_path):
+            editor_col, preview_col = resizable_columns([0.52, 0.48], min_width=320, key="tools_markdown_columns")
+            with editor_col:
+                edited_content = render_tool_code_editor(selected_path)
+            if edited_content != read_text_file(selected_path):
+                save_tool_file(selected_path, edited_content)
+            with preview_col:
+                pseudo_project = Project("tools", tools_dir.resolve())
+                pseudo_note = ToolDocument(selected_path.name, selected_path)
+                render_preview(pseudo_project, pseudo_note, edited_content, allow_actions=False, source_suffix=":tools")
+        elif is_editable_tool_file(selected_path):
+            edited_content = render_tool_code_editor(selected_path)
+            if edited_content != read_text_file(selected_path):
+                save_tool_file(selected_path, edited_content)
+        else:
+            render_tool_download_card(selected_path, tools_dir)
+    except UnicodeDecodeError:
+        st.warning("This file is not valid UTF-8 text and cannot be edited here.")
+    except OSError as exc:
+        st.error(f"Could not edit tool file: {exc}")
 
 
 def preview_key(note) -> str:
@@ -1063,6 +1861,7 @@ def start_agent_command(
     prompt: str,
     tools_dir: Path,
     agent: str,
+    agent_timeout_seconds: int,
 ) -> AgentRunState:
     save_editor_state(note)
     git_commit_all(project.path, "Checkpoint before agent command")
@@ -1076,6 +1875,7 @@ def start_agent_command(
         prompt=prompt,
         tools_dir=tools_dir,
         agent=agent,
+        agent_timeout_seconds=agent_timeout_seconds,
         before_status=set(git_status_lines(project.path)),
         progress=queue.Queue(),
         stop_requested=threading.Event(),
@@ -1097,7 +1897,7 @@ def start_agent_command(
 
 
 def _agent_worker(run_state: AgentRunState) -> None:
-    agent = default_agent(run_state.agent)
+    agent = default_agent(run_state.agent, timeout_seconds=run_state.agent_timeout_seconds)
     context = AgentContext(
         project_dir=run_state.project.path,
         project_name=run_state.project.name,
@@ -1244,7 +2044,15 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
             else prompt.strip()
         )
         try:
-            start_agent_command(project, note, agent_prompt, tools_dir, get_config().agent)
+            config = get_config()
+            start_agent_command(
+                project,
+                note,
+                agent_prompt,
+                tools_dir,
+                config.agent,
+                config.agent_timeout_seconds,
+            )
             st.session_state.last_agent_error = None
         except (OSError, GitError, AgentError) as exc:
             st.session_state.last_agent_error = f"Could not start agent: {exc}"
@@ -1263,15 +2071,29 @@ def main() -> None:
 
     try:
         ensure_tools_dir(tools_dir)
+        ensure_tools_git_repo(tools_dir)
         projects = list_projects(notebook_dir)
-    except OSError as exc:
+    except (OSError, GitError) as exc:
         st.error(f"Could not open workspace folders: {exc}")
         return
     hydrate_selection_from_query(projects)
 
+    if st.session_state.get("workspace_view") == "tools":
+        try:
+            commit_tools_if_idle(tools_dir, config.autocommit_seconds)
+        except GitError as exc:
+            st.warning(f"Tools autosave commit failed: {exc}")
+        with st.sidebar:
+            render_tools_sidebar(tools_dir)
+        render_tools_workspace(tools_dir)
+        return
+
     project = current_project(projects)
     if project is None:
         with st.sidebar:
+            if st.button("Tools", key="show_tools_view_empty", icon=":material/construction:", width="stretch"):
+                st.session_state.workspace_view = "tools"
+                st.rerun()
             if st.button(
                 ICON_BUTTON_LABEL,
                 key="open_new_project_empty",
@@ -1290,12 +2112,20 @@ def main() -> None:
 
     try:
         commit_if_idle(project, config.autocommit_seconds)
+        commit_tools_if_idle(tools_dir, config.autocommit_seconds)
     except GitError as exc:
         st.warning(f"Autosave commit failed: {exc}")
 
     note_before_project_navigation = current_note(list_notes(project))
 
     with st.sidebar:
+        if st.button("Tools", key="show_tools_view", icon=":material/construction:", width="stretch"):
+            if note_before_project_navigation is not None:
+                save_editor_state(note_before_project_navigation)
+            st.session_state.workspace_view = "tools"
+            st.rerun()
+        st.divider()
+
         project_names = [item.name for item in projects]
         project_header, project_new, project_archive = st.columns([0.66, 0.17, 0.17], vertical_alignment="bottom")
         with project_header:

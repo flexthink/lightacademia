@@ -78,6 +78,13 @@ class CodexProgressTest(unittest.TestCase):
         self.assertIsInstance(create_agent("codex"), CodexCliAgent)
         self.assertIsInstance(create_agent("claude"), ClaudeCliAgent)
 
+    def test_create_agent_applies_timeout(self) -> None:
+        codex = create_agent("codex", timeout_seconds=1234)
+        claude = create_agent("claude", timeout_seconds=1234)
+
+        self.assertEqual(codex.timeout_seconds, 1234)
+        self.assertEqual(claude.timeout_seconds, 1234)
+
     def test_preserves_reasoning_text(self) -> None:
         progress = codex_progress_from_event(
             {

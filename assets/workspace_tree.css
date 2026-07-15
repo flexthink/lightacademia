@@ -1,0 +1,84 @@
+.la-workspace-tree {
+  color: var(--st-text-color, #2e2923);
+  font-family: var(--st-font, sans-serif);
+  font-size: var(--st-base-font-size, 14px);
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.la-workspace-tree-node {
+  min-width: 0;
+}
+
+.la-workspace-tree-row {
+  align-items: center;
+  background: transparent;
+  border-radius: 4px;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  gap: 5px;
+  min-height: 30px;
+  overflow: hidden;
+  padding: 3px 6px;
+  user-select: none;
+}
+
+.la-workspace-tree-row:hover {
+  background: #eee7d7;
+}
+
+.la-workspace-tree-row.is-selected {
+  background: #e4eadf;
+  box-shadow: inset 3px 0 0 #8f3f35;
+  color: #6f3029;
+  font-weight: 600;
+}
+
+.la-workspace-tree-chevron {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 16px;
+  font: inherit;
+  height: 22px;
+  justify-content: center;
+  opacity: 0.65;
+  padding: 0;
+  width: 16px;
+}
+
+.la-workspace-tree-chevron:empty {
+  cursor: default;
+}
+
+.la-workspace-tree-icon {
+  color: #8f3f35;
+  flex: 0 0 18px;
+  height: 18px;
+  width: 18px;
+}
+
+.la-workspace-tree-icon svg {
+  display: block;
+  height: 18px;
+  width: 18px;
+}
+
+.la-workspace-tree-file-icon {
+  color: #6f675b;
+}
+
+.la-workspace-tree-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.la-workspace-tree-children[hidden] {
+  display: none;
+}

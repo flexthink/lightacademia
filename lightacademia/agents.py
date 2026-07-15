@@ -521,17 +521,17 @@ class ClaudeCliAgent(CodexCliAgent):
         }
 
 
-def create_agent(kind: str) -> Agent:
+def create_agent(kind: str, timeout_seconds: int = 3600) -> Agent:
     normalized = kind.strip().lower()
     if normalized == "codex":
-        return CodexCliAgent()
+        return CodexCliAgent(timeout_seconds=timeout_seconds)
     if normalized in {"claude", "claude-code", "claude_code"}:
-        return ClaudeCliAgent()
+        return ClaudeCliAgent(timeout_seconds=timeout_seconds)
     raise AgentError(f"Unknown agent: {kind}. Expected one of: codex, claude.")
 
 
-def default_agent(kind: str = "codex") -> Agent:
-    return create_agent(kind)
+def default_agent(kind: str = "codex", timeout_seconds: int = 3600) -> Agent:
+    return create_agent(kind, timeout_seconds=timeout_seconds)
 
 
 def event_text(value: Any) -> str:
