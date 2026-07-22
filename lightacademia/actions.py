@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from markdown_it import MarkdownIt
@@ -26,6 +27,29 @@ class ActionParseResult:
 
 
 _MARKDOWN = MarkdownIt("commonmark")
+
+
+def format_note_action(name: str, instructions: str) -> str:
+    cleaned_name = name.strip()
+    cleaned_instructions = instructions.strip()
+    longest_backtick_run = max(
+        (len(run) for run in _backtick_runs(f"{cleaned_name}\n{cleaned_instructions}")),
+        default=0,
+    )
+    fence = "`" * max(3, longest_backtick_run + 1)
+    return f"{fence}action\nname: {cleaned_name}\n\n{cleaned_instructions}\n{fence}"
+
+
+def _backtick_runs(value: str) -> Iterator[str]:
+    run = ""
+    for character in value:
+        if character == "`":
+            run += character
+        elif run:
+            yield run
+            run = ""
+    if run:
+        yield run
 
 
 def parse_note_actions(markdown: str) -> ActionParseResult:

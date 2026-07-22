@@ -2,10 +2,30 @@ from __future__ import annotations
 
 import unittest
 
-from lightacademia.actions import build_action_prompt, parse_note_actions
+from lightacademia.actions import build_action_prompt, format_note_action, parse_note_actions
 
 
 class ParseNoteActionsTest(unittest.TestCase):
+    def test_formats_action_for_insertion(self) -> None:
+        markdown = format_note_action("  Plot results  ", "  Read the data.\nCreate the plot.  ")
+
+        self.assertEqual(
+            markdown,
+            "```action\nname: Plot results\n\nRead the data.\nCreate the plot.\n```",
+        )
+        action = parse_note_actions(markdown).actions[0]
+        self.assertEqual(action.name, "Plot results")
+        self.assertEqual(action.instructions, "Read the data.\nCreate the plot.")
+
+    def test_formats_action_with_nested_code_fence(self) -> None:
+        markdown = format_note_action("Analyze", "Run:\n```python\nprint('ok')\n```")
+
+        self.assertTrue(markdown.startswith("````action\n"))
+        self.assertEqual(
+            parse_note_actions(markdown).actions[0].instructions,
+            "Run:\n```python\nprint('ok')\n```",
+        )
+
     def test_parses_multiple_action_fences(self) -> None:
         result = parse_note_actions(
             """# Results

@@ -15,6 +15,8 @@ RESERVED_PROJECT_NAMES = {"archived"}
 HOME_NOTE = "Home.md"
 PROJECT_SKILL = "SKILL.md"
 PROJECT_DIRECTORIES = ("chats", "archived", "data", "assets", "code")
+NOTEBOOK_READY_FILE = ".ready"
+STOCK_NOTEBOOK_DIR = Path(__file__).resolve().parent.parent / "starter-notebook"
 
 
 @dataclass(frozen=True)
@@ -30,15 +32,57 @@ class Note:
 
 
 def slugify(value: str, fallback: str = "untitled") -> str:
-    slug = re.sub(r"[^A-Za-z0-9._ -]+", "", value).strip()
-    slug = re.sub(r"\s+", "-", slug)
+    slug = safe_name(value, fallback)
+    slug = slug.replace(" ", "-")
     slug = slug.strip(".-")
     return slug or fallback
+
+
+def safe_name(value: str, fallback: str = "untitled") -> str:
+    normalized = re.sub(r"\s+", " ", value)
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "", normalized).strip()
+    name = name.strip(".- ")
+    return name or fallback
 
 
 def ensure_notebook(notebook_dir: Path) -> None:
     notebook_dir.mkdir(parents=True, exist_ok=True)
     (notebook_dir / "archived").mkdir(exist_ok=True)
+
+
+def initialize_notebook(notebook_dir: Path, stock_notebook_dir: Path = STOCK_NOTEBOOK_DIR) -> bool:
+    notebook_dir = notebook_dir.resolve()
+    ready_file = notebook_dir / NOTEBOOK_READY_FILE
+    if ready_file.is_file():
+        return False
+
+    ensure_notebook(notebook_dir)
+    if not stock_notebook_dir.is_dir():
+        raise FileNotFoundError(f"Stock notebook folder not found: {stock_notebook_dir}")
+
+    for source in sorted(stock_notebook_dir.iterdir(), key=lambda path: path.name.lower()):
+        if not source.is_dir() or source.name in RESERVED_PROJECT_NAMES or source.name.startswith("."):
+            continue
+        target = notebook_dir / source.name
+        if target.exists():
+            continue
+        try:
+            shutil.copytree(
+                source,
+                target,
+                ignore=shutil.ignore_patterns(".git", ".ready", ".DS_Store", "__pycache__", "*.pyc"),
+            )
+            project = Project(target.name, target)
+            ensure_project_directories(project)
+            git_init(target)
+            git_commit_all(target, "Create stock notebook")
+        except Exception:
+            if target.exists():
+                shutil.rmtree(target)
+            raise
+
+    ready_file.write_text("Light Academia notebook initialized\n", encoding="utf-8")
+    return True
 
 
 def ensure_tools_dir(tools_dir: Path) -> None:
@@ -90,7 +134,7 @@ def project_skill_boilerplate() -> str:
 
 def create_project(notebook_dir: Path, title: str) -> Project:
     ensure_notebook(notebook_dir)
-    name = slugify(title, "new-project")
+    name = safe_name(title, "new project")
     if name in RESERVED_PROJECT_NAMES:
         name = "project"
     project_path = unique_child_path(notebook_dir, name)
@@ -132,7 +176,7 @@ def list_notes(project: Project) -> list[Note]:
 
 
 def create_note(project: Project, title: str) -> Note:
-    stem = slugify(title, "new-note")
+    stem = safe_name(title, "new note")
     path = unique_child_path(project.path, stem, ".md")
     heading = title.strip() or path.stem.replace("-", " ").title()
     path.write_text(f"# {heading}\n\n", encoding="utf-8")
@@ -148,7 +192,7 @@ def save_note(note: Note, content: str) -> None:
 
 
 def rename_note(project: Project, note: Note, new_title: str) -> Note:
-    stem = slugify(new_title, note.path.stem)
+    stem = safe_name(new_title, note.path.stem)
     target = unique_child_path(project.path, stem, ".md")
     git_mv(project.path, note.path, target)
     return Note(target.name, target)

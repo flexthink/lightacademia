@@ -30,11 +30,15 @@ def search_notes(notes: list[Note], query: str, limit: int = 5, bm25s_module: An
             raise SearchUnavailable("Install `bm25s` to enable search.") from exc
 
     documents = [f"{note.name}\n{read_note(note)}" for note in notes]
-    corpus_tokens = bm25s.tokenize(documents)
+    corpus_tokens = bm25s.tokenize(documents, show_progress=False)
     retriever = bm25s.BM25()
-    retriever.index(corpus_tokens)
-    query_tokens = bm25s.tokenize([cleaned_query])
-    results, scores = retriever.retrieve(query_tokens, k=min(limit, len(notes)))
+    retriever.index(corpus_tokens, show_progress=False)
+    query_tokens = bm25s.tokenize([cleaned_query], show_progress=False)
+    results, scores = retriever.retrieve(
+        query_tokens,
+        k=min(limit, len(notes)),
+        show_progress=False,
+    )
 
     ranked: list[SearchResult] = []
     for index, score in zip(_flatten(results), _flatten(scores), strict=False):

@@ -28,6 +28,11 @@ Use a custom notebook folder:
 python -m streamlit run app.py -- --notebook ./my-notebook
 ```
 
+On first launch, Light Academia copies the stock projects from
+`starter-notebook/` into the configured notebook folder and creates a `.ready`
+marker there. Existing projects are preserved. Later launches skip this setup
+while the marker exists.
+
 Use a custom automatic commit inactivity period:
 
 ```bash

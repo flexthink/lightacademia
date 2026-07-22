@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -29,7 +30,7 @@ from streamlit.components.v2.get_bidi_component_manager import get_bidi_componen
 from streamlit.components.v2.manifest_scanner import ComponentConfig, ComponentManifest
 from streamlit_extras.resizable_columns import resizable_columns
 
-from lightacademia.actions import NoteAction, build_action_prompt, parse_note_actions
+from lightacademia.actions import NoteAction, build_action_prompt, format_note_action, parse_note_actions
 from lightacademia.agents import (
     AgentContext,
     AgentError,
@@ -72,6 +73,7 @@ from lightacademia.storage import (
     create_project,
     ensure_project_directories,
     ensure_tools_dir,
+    initialize_notebook,
     list_notes,
     list_projects,
     read_note,
@@ -556,12 +558,39 @@ def add_link_dialog(project: Project, note) -> None:
     if st.button("Add link", type="primary", icon=":material/link:"):
         try:
             save_editor_state(note)
-            link_markdown = f"[{note_display_name(target_note_name)}]({target_note_name})"
+            link_markdown = f"[{note_display_name(target_note_name)}]({quote(target_note_name)})"
             insert_markdown_at_editor_cursor(note, link_markdown)
             st.session_state.source_visible = True
             st.rerun()
         except OSError as exc:
             st.error(f"Could not add link: {exc}")
+
+
+@st.dialog("Add action", icon=":material/bolt:")
+def add_action_dialog(project: Project, note) -> None:
+    name = st.text_input(
+        "Name",
+        key=f"action_name_{project.name}_{note.name}",
+    )
+    instructions = st.text_area(
+        "Instructions",
+        height=180,
+        key=f"action_instructions_{project.name}_{note.name}",
+    )
+    if st.button("Add action", type="primary", icon=":material/bolt:"):
+        if not name.strip():
+            st.warning("Enter an action name.")
+            return
+        if not instructions.strip():
+            st.warning("Enter action instructions.")
+            return
+        try:
+            save_editor_state(note)
+            insert_markdown_at_editor_cursor(note, format_note_action(name, instructions))
+            st.session_state.source_visible = True
+            st.rerun()
+        except OSError as exc:
+            st.error(f"Could not add action: {exc}")
 
 
 @st.dialog("Note history", icon=":material/history:")
@@ -813,6 +842,7 @@ def init_state() -> None:
         "agent_progress_entries": [],
         "agent_progress_chars": 0,
         "requested_action": None,
+        "agent_chat_revision": 0,
         "source_visible": False,
         "editor_cursors": {},
         "history_revision": None,
@@ -1710,6 +1740,7 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
                 help="Select this action",
             ):
                 st.session_state.requested_action = event
+                st.session_state.agent_chat_revision += 1
                 st.rerun()
             with st.expander("Action description", expanded=False):
                 action_markdown = "".join(lines[start_line:end_line])
@@ -1984,8 +2015,14 @@ def finish_agent_run(run_state: AgentRunState) -> None:
 
 def render_agent_panel(project: Project, note, actions: tuple[NoteAction, ...], tools_dir: Path) -> None:
     run_state = active_agent_run()
+    agent_chat_revision = st.session_state.get("agent_chat_revision", 0)
     with st.container(key="agent_panel"):
-        with st.expander("Agent chat", expanded=True):
+        with st.expander(
+            "Agent chat",
+            expanded=True,
+            key=f"agent_chat_expanded_{agent_chat_revision}",
+            on_change="rerun",
+        ):
             if run_state is not None:
                 render_agent_progress_panel()
             else:
@@ -2070,6 +2107,7 @@ def main() -> None:
     tools_dir = config.tools_dir
 
     try:
+        initialize_notebook(notebook_dir)
         ensure_tools_dir(tools_dir)
         ensure_tools_git_repo(tools_dir)
         projects = list_projects(notebook_dir)
@@ -2309,6 +2347,14 @@ def main() -> None:
                 disabled=is_history_view,
             ):
                 add_link_dialog(project, note)
+            if st.button(
+                ICON_BUTTON_LABEL,
+                key="open_add_action",
+                help="Add action",
+                icon=":material/bolt:",
+                disabled=is_history_view,
+            ):
+                add_action_dialog(project, note)
             if st.button(
                 ICON_BUTTON_LABEL,
                 key="sync_project",
