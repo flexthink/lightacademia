@@ -2,6 +2,10 @@
 
 Local-first research notes with an agent-assisted project workspace.
 
+![Light Academia notebook workspace with Markdown editing, rendered preview, and agent controls](assets/Screenshot.png)
+
+*A research note shown in the split editor and preview workspace.*
+
 ## Vibe coding disclaimer
 
 This project was developed with substantial AI assistance and prioritizes functionality over software engineering rigor. The code may contain
