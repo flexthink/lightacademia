@@ -106,7 +106,6 @@ except Exception:  # pragma: no cover - optional Streamlit component
 DEFAULT_NOTEBOOK_DIR = Path("notebook")
 DEFAULT_TOOLS_DIR = Path("tools")
 DEFAULT_AUTOCOMMIT_SECONDS = 5 * 60
-PREVIEW_DEBOUNCE_SECONDS = 0.65
 NOTE_PANE_HEIGHT = 430
 ICON_BUTTON_LABEL = ""
 LOGO_PATH = Path("assets/logo.png")
@@ -847,10 +846,6 @@ def init_state() -> None:
         "last_edit_at": None,
         "last_commit_at": None,
         "editor_revision": 0,
-        "preview_note_key": None,
-        "preview_content": "",
-        "preview_pending_content": "",
-        "preview_pending_at": None,
         "preview_source_key": None,
         "preview_source_content": "",
         "preview_source_project_dir": None,
@@ -1688,29 +1683,7 @@ def preview_key(note) -> str:
     return f"{note.path}:{st.session_state.editor_revision}"
 
 
-def debounced_preview_content(key: str, content: str) -> str:
-    now = time.time()
-    if st.session_state.preview_note_key != key:
-        st.session_state.preview_note_key = key
-        st.session_state.preview_content = content
-        st.session_state.preview_pending_content = content
-        st.session_state.preview_pending_at = now
-        return content
-
-    if content != st.session_state.preview_pending_content:
-        st.session_state.preview_pending_content = content
-        st.session_state.preview_pending_at = now
-
-    pending_at = st.session_state.preview_pending_at
-    if pending_at is None or now - pending_at >= PREVIEW_DEBOUNCE_SECONDS:
-        st.session_state.preview_content = st.session_state.preview_pending_content
-    elif st.session_state.preview_content == "":
-        st.session_state.preview_content = st.session_state.preview_pending_content
-
-    return st.session_state.preview_content
-
-
-@st.fragment(run_every="700ms")
+@st.fragment
 def render_preview_fragment() -> None:
     if st.session_state.pop("board_action_needs_app_rerun", False):
         st.rerun(scope="app")
@@ -1721,10 +1694,9 @@ def render_preview_fragment() -> None:
     allow_actions = bool(st.session_state.get("preview_allow_actions", True))
     if not source_key or not source_project_dir:
         return
-    preview_content = debounced_preview_content(source_key, source_content)
     with st.container(key="preview_pane"):
         render_project_markdown(
-            preview_content,
+            source_content,
             Path(source_project_dir),
             source_key,
             note_name=source_note_name,
@@ -2025,10 +1997,6 @@ def reload_note_from_disk() -> None:
     st.session_state.requested_action = None
     st.session_state.queued_agent_prompt = None
     clear_history_revision()
-    st.session_state.preview_note_key = None
-    st.session_state.preview_content = ""
-    st.session_state.preview_pending_content = ""
-    st.session_state.preview_pending_at = None
     st.session_state.preview_source_key = None
     st.session_state.preview_source_content = ""
     st.session_state.preview_source_project_dir = None
