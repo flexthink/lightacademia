@@ -1,4 +1,4 @@
-streamlit>=1.57,<2
+streamlit>=1.59,<2
 PyYAML
 streamlit-code-editor
 markdown-it-py>=3.0,<5
