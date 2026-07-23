@@ -13,6 +13,8 @@ Rules:
 - Do not use `data/` for raw datasets or full dataset management.
 - When a CSV should be shown as an interactive table in Light Academia, reference it from Markdown with a project-relative dataframe link such as `[dataframe](data/metrics.csv)`.
 - Keep dataframe CSV files inside the selected project, usually under `data/`; plain Markdown readers will show the dataframe syntax as a normal link.
+- When a board request provides a board data file, write the fetched rows to that exact project-relative CSV path. The board preview reads that file directly.
+- A board refresh only fetches rows. Ignore board `actions` metadata during a refresh and never execute a board action unless the request explicitly identifies a selected row and action.
 - To show friendlier dataframe column names, place an optional fenced `dataframe` YAML block immediately after the link:
   ```dataframe
   columns:

@@ -56,4 +56,21 @@ columns:
 ```
 ````
 
+Create an agent-refreshed board with row actions:
+
+````markdown
+```board
+name: Experiments
+actions:
+- Troubleshoot: Tail the selected experiment log and summarize it
+
+Fetch experiments that ran within the last week.
+```
+````
+
+Refreshing the board immediately runs the Robot to populate
+`data/board-experiments.csv`. When available, the CSV appears as a dataframe and
+each board action appears as a button for every row. Refreshing only fetches the
+data; pressing a row action immediately starts a stoppable Robot run for that row.
+
 Use the toolbar to insert images and links at the current editor position. Rendered tables and images include copy controls for moving results into chat, slides, or papers.

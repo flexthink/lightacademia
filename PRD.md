@@ -141,7 +141,7 @@ https://github.com/bouzidanas/streamlit-code-editor
 - The `name` is used as the label in the action selector
 - The instruction body is added to the agent prompt when the action is selected and run
 - The application also includes the source note path and action name in the agent context and chat log
-- Action blocks remain visible as ordinary code blocks in the rendered Markdown preview for now
+- Action blocks remain available under a collapsed action-description section in the rendered preview
 - The preview displays a `Run: {action name}` button with a bolt icon immediately above each valid action block
 - Clicking a preview action button selects that action in the pinned action selector; it does not run the agent immediately
 - The action list is refreshed when the current note changes, is saved, or is reloaded after an agent run
@@ -159,6 +159,31 @@ Retrieve the relevant results.
 Plot the comparison.
 Calculate confidence intervals.
 Add the results to this note.
+```
+````
+
+## Note Boards
+- A note may define agent-refreshed data boards in fenced Markdown blocks with the language `board`
+- Board discovery and parsing are local and do not require an LLM call
+- A board has a required `name`, an optional YAML list of `actions`, a blank separator, and fetch instructions
+- Board data is stored at `data/board-{normalized board name}.csv` inside the current project
+- The preview displays a Refresh button that immediately runs the agent with the source note, board name, board data file, and fetch instructions; action definitions are excluded and the prompt explicitly prohibits executing board actions
+- When its CSV exists, the board renders it with `st.dataframe`
+- Each board action is displayed as a `ButtonColumn` for every CSV row
+- Clicking a row action immediately runs the agent with a prompt containing the selected row, source note, board name, board data file, action name, and action instructions
+- Refresh and row action runs use the normal progress display and can be stopped
+- Malformed board blocks are reported without preventing the note from loading
+
+Example:
+
+````markdown
+```board
+name: Experiments
+actions:
+- Resume: Resume the selected experiment
+- Troubleshoot: Tail the log file and summarize the findings
+
+Fetch experiments from the cluster that have run within the last week.
 ```
 ````
 

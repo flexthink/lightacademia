@@ -72,6 +72,28 @@ The action body can be run by itself or combined with an additional prompt.
 In the preview, a bolt button above each action block selects that action in the
 pinned agent controls without running it immediately.
 
+## Boards
+
+Boards are note-local, agent-refreshed dataframes. A board defines how to fetch
+its rows and may expose actions for each row:
+
+````markdown
+```board
+name: Experiments
+actions:
+- Resume: Resume the selected experiment
+- Troubleshoot: Tail the log file and summarize the findings
+
+Fetch experiments from the cluster that have run within the last week.
+```
+````
+
+Refreshing this example immediately runs the Robot to write
+`data/board-experiments.csv`. When the file exists, the preview displays it as
+an interactive dataframe. Refreshing never executes the board's row actions.
+Each declared action becomes a button column. Refreshes and row actions run with
+the normal stoppable progress display.
+
 ## Project images
 
 Generated images belong in the selected project's `assets/` directory and can be

@@ -8,6 +8,15 @@ const iconPaths = {
     ["line", { x1: "8", x2: "16", y1: "13", y2: "13" }],
     ["line", { x1: "8", x2: "16", y1: "17", y2: "17" }],
   ],
+  note: [
+    ["path", { d: "M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" }],
+    ["polyline", { points: "14 2 14 8 20 8" }],
+    ["line", { x1: "8", x2: "16", y1: "13", y2: "13" }],
+    ["line", { x1: "8", x2: "16", y1: "17", y2: "17" }],
+  ],
+  wrench: [
+    ["path", { d: "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z" }],
+  ],
   folder: [
     ["path", { d: "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" }],
   ],
@@ -46,20 +55,30 @@ export default function(component) {
   const selected = data.selected || "";
   const expandedDepth = Number.isInteger(data.expandedDepth) ? data.expandedDepth : 2;
   const treeId = data.treeId || "workspace";
+  const labels = data.labels || {};
+  const icons = data.icons || {};
+  const pinnedLast = new Set(data.pinnedLast || []);
 
-  function sortedEntries(tree) {
+  function sortedEntries(tree, parent = "") {
     return Object.entries(tree || {}).sort(([leftName, leftValue], [rightName, rightValue]) => {
+      const leftPath = parent ? `${parent}/${leftName}` : leftName;
+      const rightPath = parent ? `${parent}/${rightName}` : rightName;
+      const leftPinnedLast = pinnedLast.has(leftPath);
+      const rightPinnedLast = pinnedLast.has(rightPath);
+      if (leftPinnedLast !== rightPinnedLast) {
+        return leftPinnedLast ? 1 : -1;
+      }
       const leftDirectory = leftValue !== null;
       const rightDirectory = rightValue !== null;
       if (leftDirectory !== rightDirectory) {
         return leftDirectory ? -1 : 1;
       }
-      return leftName.localeCompare(rightName);
+      return (labels[leftPath] || leftName).localeCompare(labels[rightPath] || rightName);
     });
   }
 
   function defaultExpandedPaths(tree, depth = 0, parent = "", paths = new Set()) {
-    for (const [name, value] of sortedEntries(tree)) {
+    for (const [name, value] of sortedEntries(tree, parent)) {
       const path = parent ? `${parent}/${name}` : name;
       if (value !== null) {
         if (depth < expandedDepth) {
@@ -108,11 +127,17 @@ export default function(component) {
 
     const icon = document.createElement("span");
     icon.className = `la-workspace-tree-icon${isDirectory ? "" : " la-workspace-tree-file-icon"}`;
-    renderIcon(icon, isDirectory ? (expanded ? "folderOpen" : "folder") : "file");
+    const configuredIcon = icons[path];
+    renderIcon(
+      icon,
+      configuredIcon in iconPaths
+        ? configuredIcon
+        : (isDirectory ? (expanded ? "folderOpen" : "folder") : "file"),
+    );
 
     const label = document.createElement("span");
     label.className = "la-workspace-tree-label";
-    label.textContent = name;
+    label.textContent = labels[path] || name;
 
     row.append(chevron, icon, label);
     node.appendChild(row);
@@ -122,7 +147,7 @@ export default function(component) {
       children = document.createElement("div");
       children.className = "la-workspace-tree-children";
       children.hidden = !expanded;
-      for (const [childName, childValue] of sortedEntries(value)) {
+      for (const [childName, childValue] of sortedEntries(value, path)) {
         children.appendChild(renderNode(childName, childValue, `${path}/${childName}`, depth + 1));
       }
       node.appendChild(children);
@@ -153,7 +178,12 @@ export default function(component) {
         children.hidden = !expanded;
         chevron.textContent = expanded ? "▾" : "▸";
         chevron.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} ${name}`);
-        renderIcon(icon, expanded ? "folderOpen" : "folder");
+        renderIcon(
+          icon,
+          configuredIcon in iconPaths
+            ? configuredIcon
+            : (expanded ? "folderOpen" : "folder"),
+        );
       };
       chevron.onkeydown = (event) => {
         if (event.key === "Enter" || event.key === " ") {

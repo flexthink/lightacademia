@@ -39,6 +39,13 @@ from lightacademia.agents import (
     AgentStopped,
     default_agent,
 )
+from lightacademia.boards import (
+    BoardAction,
+    NoteBoard,
+    build_board_action_prompt,
+    build_board_prompt,
+    parse_note_boards,
+)
 from lightacademia.chat import append_chat_entry, list_chat_log_dates, read_chat_log
 from lightacademia.git_ops import (
     GitError,
@@ -300,10 +307,22 @@ def workspace_tree_selection(
     selected: str | None,
     key: str,
     tree_id: str,
+    *,
+    labels: dict[str, str] | None = None,
+    icons: dict[str, str] | None = None,
+    pinned_last: tuple[str, ...] = (),
 ) -> str | None:
     result = workspace_tree_component()(
         key=key,
-        data={"tree": tree, "selected": selected or "", "expandedDepth": 2, "treeId": tree_id},
+        data={
+            "tree": tree,
+            "selected": selected or "",
+            "expandedDepth": 2,
+            "treeId": tree_id,
+            "labels": labels or {},
+            "icons": icons or {},
+            "pinnedLast": list(pinned_last),
+        },
         default={"selected": selected or ""},
         on_selected_change=lambda: None,
     )
@@ -835,6 +854,7 @@ def init_state() -> None:
         "preview_source_key": None,
         "preview_source_content": "",
         "preview_source_project_dir": None,
+        "preview_source_note_name": None,
         "last_agent_response": None,
         "last_agent_error": None,
         "agent_running": False,
@@ -842,6 +862,8 @@ def init_state() -> None:
         "agent_progress_entries": [],
         "agent_progress_chars": 0,
         "requested_action": None,
+        "queued_agent_prompt": None,
+        "board_action_needs_app_rerun": False,
         "agent_chat_revision": 0,
         "source_visible": False,
         "editor_cursors": {},
@@ -1336,6 +1358,10 @@ def build_tools_tree(tools_dir: Path) -> dict[str, object]:
     return tree
 
 
+def build_notes_tree(notes) -> dict[str, object]:
+    return {note.name: None for note in notes}
+
+
 def resolve_tool_tree_selection(tools_dir: Path, selected: str | None) -> Path | None:
     if not selected:
         return None
@@ -1450,6 +1476,8 @@ def commit_before_navigation(
     if next_note is not None:
         st.session_state.note_name = next_note
     clear_history_revision()
+    st.session_state.requested_action = None
+    st.session_state.queued_agent_prompt = None
     set_selection_query(
         next_project or project.name,
         next_note if next_note is not None else (None if next_project is not None else st.session_state.note_name),
@@ -1684,18 +1712,33 @@ def debounced_preview_content(key: str, content: str) -> str:
 
 @st.fragment(run_every="700ms")
 def render_preview_fragment() -> None:
+    if st.session_state.pop("board_action_needs_app_rerun", False):
+        st.rerun(scope="app")
     source_key = st.session_state.get("preview_source_key")
     source_content = st.session_state.get("preview_source_content", "")
     source_project_dir = st.session_state.get("preview_source_project_dir")
+    source_note_name = st.session_state.get("preview_source_note_name") or ""
     allow_actions = bool(st.session_state.get("preview_allow_actions", True))
     if not source_key or not source_project_dir:
         return
     preview_content = debounced_preview_content(source_key, source_content)
     with st.container(key="preview_pane"):
-        render_project_markdown(preview_content, Path(source_project_dir), source_key, allow_actions=allow_actions)
+        render_project_markdown(
+            preview_content,
+            Path(source_project_dir),
+            source_key,
+            note_name=source_note_name,
+            allow_actions=allow_actions,
+        )
 
 
-def render_project_markdown(markdown: str, project_dir: Path, source_key: str, allow_actions: bool = True) -> None:
+def render_project_markdown(
+    markdown: str,
+    project_dir: Path,
+    source_key: str,
+    note_name: str = "",
+    allow_actions: bool = True,
+) -> None:
     rendered_markdown, note_link_errors = rewrite_project_note_links(markdown, project_dir)
     for error in note_link_errors:
         st.warning(error)
@@ -1709,6 +1752,10 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
             (action.line - 1, action.end_line, "action", action)
             for action in parse_note_actions(markdown).actions
         )
+    events.extend(
+        (board.line - 1, board.end_line, "board", board)
+        for board in parse_note_boards(markdown).boards
+    )
     events.extend(
         (image.start_line, image.end_line, "image", image)
         for image in find_standalone_images(markdown)
@@ -1746,6 +1793,15 @@ def render_project_markdown(markdown: str, project_dir: Path, source_key: str, a
                 action_markdown = "".join(lines[start_line:end_line])
                 if action_markdown.strip():
                     st.markdown(action_markdown)
+        elif event_type == "board":
+            render_note_board(
+                event,
+                project_dir,
+                note_name,
+                source_key,
+                start_line,
+                interactive=allow_actions,
+            )
         elif event_type == "image":
             try:
                 image_path = resolve_project_image(project_dir, event.target)
@@ -1811,6 +1867,130 @@ def render_project_dataframe(
     st.dataframe(dataframe, width="stretch", height=360)
 
 
+def queue_agent_prompt(prompt: str) -> None:
+    st.session_state.queued_agent_prompt = prompt
+    st.session_state.agent_chat_revision += 1
+
+
+def board_row_values(dataframe: pd.DataFrame, row_index: int) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for column, value in dataframe.iloc[row_index].to_dict().items():
+        try:
+            missing = bool(pd.isna(value))
+        except (TypeError, ValueError):
+            missing = False
+        if missing:
+            values[str(column)] = None
+        elif hasattr(value, "item"):
+            values[str(column)] = value.item()
+        else:
+            values[str(column)] = value
+    return values
+
+
+def handle_board_action_click(
+    click_key: str,
+    board: NoteBoard,
+    action: BoardAction,
+    dataframe: pd.DataFrame,
+    project_dir: Path,
+    note_name: str,
+) -> None:
+    click = st.session_state.get(click_key)
+    if not click:
+        return
+    row_index = int(click["row"])
+    if row_index < 0 or row_index >= len(dataframe.index):
+        return
+    prompt = build_board_action_prompt(
+        board,
+        action,
+        board_row_values(dataframe, row_index),
+        note_name,
+    )
+    start_board_agent_command(
+        prompt,
+        project_dir,
+        note_name,
+        operation="board action",
+    )
+    # ButtonColumn invokes this as a widget callback, where st.rerun() is a
+    # no-op. The fragment run immediately following the callback performs it.
+    st.session_state.board_action_needs_app_rerun = True
+
+
+def render_note_board(
+    board: NoteBoard,
+    project_dir: Path,
+    note_name: str,
+    source_key: str,
+    start_line: int,
+    interactive: bool,
+) -> None:
+    board_key = hashlib.sha256(
+        f"{source_key}:board:{start_line}:{board.name}".encode("utf-8")
+    ).hexdigest()[:16]
+    st.markdown(f"#### {board.name}")
+    controls_enabled = interactive and not bool(st.session_state.get("agent_running"))
+    if controls_enabled and st.button(
+        f"**Refresh:** {board.name}",
+        key=f"refresh_board_{board_key}",
+        icon=":material/refresh:",
+        help="Refresh this board",
+    ):
+        start_board_agent_command(
+            build_board_prompt(board, note_name),
+            project_dir,
+            note_name,
+            operation="board refresh",
+        )
+        st.rerun(scope="app")
+    with st.expander("Fetch instructions", expanded=False):
+        st.markdown(board.instructions)
+
+    data_path = (project_dir.resolve() / board.data_file).resolve()
+    if not data_path.is_relative_to(project_dir.resolve()):
+        st.warning(f"Board data file must stay inside the project: `{board.data_file}`.")
+        return
+    st.caption(board.data_file)
+    if not data_path.is_file():
+        st.info("No board data yet. Refresh the board to fetch it.")
+        return
+    try:
+        dataframe = pd.read_csv(data_path)
+    except Exception as exc:
+        st.warning(f"Could not read board data `{board.data_file}`: {exc}")
+        return
+
+    display_dataframe = dataframe.copy()
+    column_config: dict[str, object] = {}
+    column_order = list(display_dataframe.columns)
+    if controls_enabled:
+        for action_index, action in enumerate(board.actions):
+            column_name = f"__board_action_{action_index}"
+            click_key = f"board_action_click_{board_key}_{action_index}"
+            display_dataframe[column_name] = [":material/bolt: Run"] * len(display_dataframe.index)
+            column_order.append(column_name)
+            column_config[column_name] = st.column_config.ButtonColumn(
+                action.name,
+                width="small",
+                help=action.instructions,
+                type="secondary",
+                on_click=handle_board_action_click,
+                args=(click_key, board, action, dataframe, project_dir, note_name),
+                key=click_key,
+            )
+    st.dataframe(
+        display_dataframe,
+        width="stretch",
+        height=360,
+        hide_index=True,
+        column_order=column_order,
+        column_config=column_config,
+        key=f"board_dataframe_{board_key}",
+    )
+
+
 def render_copyable_image(image_path: Path, alt: str, source_key: str, start_line: int) -> None:
     mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
     if not mime_type.startswith("image/"):
@@ -1835,6 +2015,7 @@ def render_preview(project: Project, note, content: str, allow_actions: bool = T
     st.session_state.preview_source_key = f"{preview_key(note)}{source_suffix}"
     st.session_state.preview_source_content = content
     st.session_state.preview_source_project_dir = str(project.path)
+    st.session_state.preview_source_note_name = note.name
     st.session_state.preview_allow_actions = allow_actions
     render_preview_fragment()
 
@@ -1842,6 +2023,7 @@ def render_preview(project: Project, note, content: str, allow_actions: bool = T
 def reload_note_from_disk() -> None:
     st.session_state.editor_revision += 1
     st.session_state.requested_action = None
+    st.session_state.queued_agent_prompt = None
     clear_history_revision()
     st.session_state.preview_note_key = None
     st.session_state.preview_content = ""
@@ -1850,6 +2032,7 @@ def reload_note_from_disk() -> None:
     st.session_state.preview_source_key = None
     st.session_state.preview_source_content = ""
     st.session_state.preview_source_project_dir = None
+    st.session_state.preview_source_note_name = None
 
 
 def action_option_label(action: NoteAction | None) -> str:
@@ -1925,6 +2108,40 @@ def start_agent_command(
     logger.info("Starting agent run %s for project=%s note=%s", run_id, project.name, run_state.note_name)
     run_state.thread.start()
     return run_state
+
+
+def start_board_agent_command(
+    prompt: str,
+    project_dir: Path,
+    note_name: str,
+    operation: str,
+) -> bool:
+    if active_agent_run() is not None:
+        st.session_state.last_agent_error = f"Could not start {operation}: Robot is already running."
+        return False
+    project_path = project_dir.resolve()
+    project = Project(project_path.name, project_path)
+    note = next((item for item in list_notes(project) if item.name == note_name), None)
+    if note is None:
+        st.session_state.last_agent_error = f"Could not start {operation}: note `{note_name}` was not found."
+        return False
+    try:
+        config = get_config()
+        start_agent_command(
+            project,
+            note,
+            prompt.strip(),
+            config.tools_dir,
+            config.agent,
+            config.agent_timeout_seconds,
+        )
+        st.session_state.last_agent_error = None
+        st.session_state.agent_chat_revision += 1
+        logger.info("Started %s for board in note=%s", operation, note_name)
+        return True
+    except (OSError, GitError, AgentError) as exc:
+        st.session_state.last_agent_error = f"Could not start {operation}: {exc}"
+        return False
 
 
 def _agent_worker(run_state: AgentRunState) -> None:
@@ -2058,6 +2275,12 @@ def render_agent_progress_panel() -> None:
 
 
 def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], tools_dir: Path) -> None:
+    prompt_key = f"agent_prompt_{note.name}_{st.session_state.editor_revision}"
+    queued_prompt = st.session_state.pop("queued_agent_prompt", None)
+    if isinstance(queued_prompt, str) and queued_prompt.strip():
+        st.session_state[action_selector_key(note)] = None
+        st.session_state[prompt_key] = queued_prompt
+
     action_input, prompt_input = st.columns([0.34, 0.66], vertical_alignment="top")
     with action_input:
         selected_action = st.selectbox(
@@ -2068,7 +2291,6 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
             label_visibility="collapsed",
         )
     with prompt_input:
-        prompt_key = f"agent_prompt_{note.name}_{st.session_state.editor_revision}"
         prompt = st.text_area("Message", height=120, key=prompt_key, label_visibility="collapsed")
     submitted = st.button(
         "Run agent",
@@ -2160,6 +2382,8 @@ def main() -> None:
         if st.button("Tools", key="show_tools_view", icon=":material/construction:", width="stretch"):
             if note_before_project_navigation is not None:
                 save_editor_state(note_before_project_navigation)
+            st.session_state.requested_action = None
+            st.session_state.queued_agent_prompt = None
             st.session_state.workspace_view = "tools"
             st.rerun()
         st.divider()
@@ -2214,14 +2438,23 @@ def main() -> None:
     sync_selection_to_query(project, note.name)
 
     with st.sidebar:
-        note_names = [item.name for item in notes]
-        selected_note = st.radio(
-            "Notes",
-            note_names,
-            index=note_names.index(note.name),
-            format_func=note_display_name,
+        st.markdown("### Notes")
+        note_tree = build_notes_tree(notes)
+        selected_note = workspace_tree_selection(
+            note_tree,
+            note.name,
+            key=f"notes_tree_{project.path.resolve()}_{st.session_state.workspace_tree_revision}",
+            tree_id=f"notes:{project.path.resolve()}",
+            labels={item.name: note_display_name(item.name) for item in notes},
+            icons={
+                item.name: "wrench" if item.name.casefold() == "skill.md" else "note"
+                for item in notes
+            },
+            pinned_last=tuple(
+                item.name for item in notes if item.name.casefold() == "skill.md"
+            ),
         )
-        if selected_note != note.name:
+        if selected_note and selected_note != note.name:
             commit_before_navigation(project, current_note_to_save=note, next_note=selected_note)
 
         st.divider()
@@ -2400,10 +2633,13 @@ def main() -> None:
 
     action_source = read_note(note) if is_history_view else edited_content
     action_result = parse_note_actions(action_source)
+    board_result = parse_note_boards(action_source)
     if not is_history_view:
         apply_requested_action(note, action_result.actions)
     for error in action_result.errors:
         st.warning(f"Action block at line {error.line}: {error.message}")
+    for error in board_result.errors:
+        st.warning(f"Board block at line {error.line}: {error.message}")
 
     if st.session_state.last_sync_error:
         st.warning(st.session_state.last_sync_error)
