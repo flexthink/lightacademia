@@ -83,6 +83,15 @@ name: Experiments
 actions:
 - Resume: Resume the selected experiment
 - Troubleshoot: Tail the log file and summarize the findings
+filters:
+- Name
+- Cluster: dropdown
+- Status: dropdown
+columns:
+- Name
+- Cluster
+- Status
+- Epoch
 
 Fetch experiments from the cluster that have run within the last week.
 ```
@@ -93,6 +102,14 @@ Refreshing this example immediately runs the Robot to write
 an interactive dataframe. Refreshing never executes the board's row actions.
 Each declared action becomes a button column. Refreshes and row actions run with
 the normal stoppable progress display.
+
+Board filters are local and do not call the Robot. A bare column name creates a
+case-insensitive text filter. Add `: dropdown` to select from the distinct values
+in that CSV column. The currently supported types are `text` and `dropdown`.
+
+The optional `columns` list defines the required CSV schema and display order.
+Light Academia includes it in the Robot's refresh instructions and warns when
+the generated CSV is missing a requested column.
 
 ## Project images
 

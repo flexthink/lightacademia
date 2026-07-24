@@ -165,7 +165,10 @@ Add the results to this note.
 ## Note Boards
 - A note may define agent-refreshed data boards in fenced Markdown blocks with the language `board`
 - Board discovery and parsing are local and do not require an LLM call
-- A board has a required `name`, an optional YAML list of `actions`, a blank separator, and fetch instructions
+- A board has a required `name`, optional YAML lists of `actions`, `filters`, and `columns`, a blank separator, and fetch instructions
+- `columns` defines the required CSV column names and display order and is included in the board refresh instructions sent to the agent
+- A bare filter column uses a case-insensitive text filter; a filter mapped to `dropdown` uses the distinct CSV values
+- `text` and `dropdown` are the supported board filter types
 - Board data is stored at `data/board-{normalized board name}.csv` inside the current project
 - The preview displays a Refresh button that immediately runs the agent with the source note, board name, board data file, and fetch instructions; action definitions are excluded and the prompt explicitly prohibits executing board actions
 - When its CSV exists, the board renders it with `st.dataframe`
@@ -182,6 +185,15 @@ name: Experiments
 actions:
 - Resume: Resume the selected experiment
 - Troubleshoot: Tail the log file and summarize the findings
+filters:
+- Name
+- Cluster: dropdown
+- Status: dropdown
+columns:
+- Name
+- Cluster
+- Status
+- Epoch
 
 Fetch experiments from the cluster that have run within the last week.
 ```

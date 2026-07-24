@@ -14,7 +14,7 @@ class BoardRenderTest(unittest.TestCase):
             data_dir = project_dir / "data"
             data_dir.mkdir()
             (data_dir / "board-experiments.csv").write_text(
-                "experiment,epoch\nrun-1,4\nrun-2,7\n",
+                "Name,Cluster,Status,Epoch\nrun-1,Fir,Running,4\nrun-2,Rorqual,Failed,7\n",
                 encoding="utf-8",
             )
             script = f'''\
@@ -26,6 +26,15 @@ board = parse_note_boards("""```board
 name: Experiments
 actions:
 - Resume: Resume the selected experiment
+filters:
+- Name
+- Cluster: dropdown
+- Status: dropdown
+columns:
+- Name
+- Status
+- Cluster
+- Epoch
 
 Fetch recent experiments.
 ```
@@ -37,6 +46,13 @@ render_note_board(board, Path({str(project_dir)!r}), "Experiments.md", "test", 0
 
             self.assertEqual(list(app_test.exception), [])
             self.assertEqual(len(app_test.dataframe), 1)
+            self.assertEqual(len(app_test.text_input), 1)
+            self.assertEqual(len(app_test.selectbox), 2)
+
+            app_test.text_input[0].input("run-2").run()
+
+            self.assertEqual(list(app_test.exception), [])
+            self.assertEqual(app_test.dataframe[0].value["Name"].tolist(), ["run-2"])
 
 
 if __name__ == "__main__":

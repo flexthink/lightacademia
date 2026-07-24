@@ -16,10 +16,18 @@ class BoardAction:
 
 
 @dataclass(frozen=True)
+class BoardFilter:
+    column: str
+    filter_type: str
+
+
+@dataclass(frozen=True)
 class NoteBoard:
     name: str
     instructions: str
     actions: tuple[BoardAction, ...]
+    filters: tuple[BoardFilter, ...]
+    columns: tuple[str, ...]
     data_file: str
     line: int
     end_line: int
@@ -110,12 +118,77 @@ def parse_note_boards(markdown: str) -> BoardParseResult:
                 continue
             parsed_actions.append(BoardAction(cleaned_name, cleaned_instructions))
 
+        parsed_filters: list[BoardFilter] = []
+        raw_filters = metadata.get("filters", [])
+        if raw_filters is None:
+            raw_filters = []
+        if not isinstance(raw_filters, list):
+            errors.append(BoardParseError(block_line, "Board filters must be a YAML list."))
+            raw_filters = []
+        seen_filter_columns: set[str] = set()
+        for raw_filter in raw_filters:
+            if isinstance(raw_filter, str):
+                filter_column = raw_filter.strip()
+                filter_type = "text"
+            elif isinstance(raw_filter, dict) and len(raw_filter) == 1:
+                raw_column, raw_type = next(iter(raw_filter.items()))
+                filter_column = str(raw_column).strip()
+                filter_type = str(raw_type or "text").strip().lower()
+            else:
+                errors.append(
+                    BoardParseError(
+                        block_line,
+                        "Each board filter must be a column name or one column-to-type mapping.",
+                    )
+                )
+                continue
+            if not filter_column:
+                errors.append(BoardParseError(block_line, "Board filter column names cannot be empty."))
+                continue
+            if filter_type not in {"text", "dropdown"}:
+                errors.append(
+                    BoardParseError(
+                        block_line,
+                        f"Board filter `{filter_column}` has unsupported type `{filter_type}`; "
+                        "use `text` or `dropdown`.",
+                    )
+                )
+                continue
+            normalized_column = filter_column.casefold()
+            if normalized_column in seen_filter_columns:
+                errors.append(BoardParseError(block_line, f"Board filter `{filter_column}` is duplicated."))
+                continue
+            seen_filter_columns.add(normalized_column)
+            parsed_filters.append(BoardFilter(filter_column, filter_type))
+
+        parsed_columns: list[str] = []
+        raw_columns = metadata.get("columns", [])
+        if raw_columns is None:
+            raw_columns = []
+        if not isinstance(raw_columns, list):
+            errors.append(BoardParseError(block_line, "Board columns must be a YAML list."))
+            raw_columns = []
+        seen_columns: set[str] = set()
+        for raw_column in raw_columns:
+            if not isinstance(raw_column, str) or not raw_column.strip():
+                errors.append(BoardParseError(block_line, "Each board column must be a non-empty name."))
+                continue
+            column = raw_column.strip()
+            normalized_column = column.casefold()
+            if normalized_column in seen_columns:
+                errors.append(BoardParseError(block_line, f"Board column `{column}` is duplicated."))
+                continue
+            seen_columns.add(normalized_column)
+            parsed_columns.append(column)
+
         end_line = token.map[1] if token.map else block_line
         boards.append(
             NoteBoard(
                 name=name,
                 instructions=instructions,
                 actions=tuple(parsed_actions),
+                filters=tuple(parsed_filters),
+                columns=tuple(parsed_columns),
                 data_file=board_data_file(name),
                 line=block_line,
                 end_line=end_line,
@@ -126,6 +199,13 @@ def parse_note_boards(markdown: str) -> BoardParseResult:
 
 
 def build_board_prompt(board: NoteBoard, note_name: str) -> str:
+    column_requirements = ""
+    if board.columns:
+        requested_columns = "\n".join(f"- {column}" for column in board.columns)
+        column_requirements = (
+            "Required CSV columns, in this order:\n"
+            f"{requested_columns}\n\n"
+        )
     return (
         "Selected note board refresh:\n"
         f"Source note: {note_name}\n"
@@ -138,10 +218,12 @@ def build_board_prompt(board: NoteBoard, note_name: str) -> str:
         "- Ignore the board's actions metadata, even if you read it from the source note.\n"
         "- Do not execute, simulate, or apply any board action to any row. Board actions are "
         "separate commands that run only when the user presses a row action button.\n\n"
+        f"{column_requirements}"
         "Output requirements:\n"
         f"- Fetch the board data using the instructions above.\n"
         f"- Write or replace the board CSV at `{board.data_file}` inside the selected project.\n"
         "- Include a header row and one data record per board row.\n"
+        "- When required CSV columns are listed above, use those exact column names and order.\n"
         "- Do not modify the board block unless the user asks you to."
     )
 

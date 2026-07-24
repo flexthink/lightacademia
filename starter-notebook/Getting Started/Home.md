@@ -21,6 +21,7 @@ Expand **Agent chat** at the bottom of the page, enter a request, and run the co
 Light Academia saves current edits before an agent run, shows live progress, reloads changed notes afterward, and records agent changes in Git with an `[agent]` prefix.
 
 See [Agent and Actions](Agent%20and%20Actions.md) for reusable actions and project guidance.
+Try the runnable [MNIST experiment board](Boards.md) for an example of agent-generated tabular data and local filters.
 
 ## Research Outputs
 
@@ -63,6 +64,15 @@ Create an agent-refreshed board with row actions:
 name: Experiments
 actions:
 - Troubleshoot: Tail the selected experiment log and summarize it
+filters:
+- Name
+- Cluster: dropdown
+- Status: dropdown
+columns:
+- Name
+- Cluster
+- Status
+- Epoch
 
 Fetch experiments that ran within the last week.
 ```
@@ -72,5 +82,8 @@ Refreshing the board immediately runs the Robot to populate
 `data/board-experiments.csv`. When available, the CSV appears as a dataframe and
 each board action appears as a button for every row. Refreshing only fetches the
 data; pressing a row action immediately starts a stoppable Robot run for that row.
+Bare filters are text searches. Add `: dropdown` to choose from values present in
+that CSV column. The `columns` list tells the Robot which CSV columns to produce
+and controls their display order.
 
 Use the toolbar to insert images and links at the current editor position. Rendered tables and images include copy controls for moving results into chat, slides, or papers.

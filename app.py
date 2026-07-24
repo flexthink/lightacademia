@@ -41,6 +41,7 @@ from lightacademia.agents import (
 )
 from lightacademia.boards import (
     BoardAction,
+    BoardFilter,
     NoteBoard,
     build_board_action_prompt,
     build_board_prompt,
@@ -1860,6 +1861,89 @@ def board_row_values(dataframe: pd.DataFrame, row_index: int) -> dict[str, objec
     return values
 
 
+def render_board_filters(
+    board_filters: tuple[BoardFilter, ...],
+    dataframe: pd.DataFrame,
+    board_key: str,
+) -> pd.DataFrame:
+    if not board_filters:
+        return dataframe
+
+    columns_by_name = {str(column).casefold(): str(column) for column in dataframe.columns}
+    configured_filters: list[tuple[BoardFilter, str]] = []
+    for board_filter in board_filters:
+        dataframe_column = columns_by_name.get(board_filter.column.casefold())
+        if dataframe_column is None:
+            st.warning(f"Board filter column `{board_filter.column}` is not present in the CSV.")
+            continue
+        configured_filters.append((board_filter, dataframe_column))
+
+    selected_values: list[tuple[BoardFilter, str, str | None]] = []
+    for row_start in range(0, len(configured_filters), 4):
+        filter_row = configured_filters[row_start : row_start + 4]
+        columns = st.columns(len(filter_row))
+        for offset, ((board_filter, dataframe_column), column) in enumerate(zip(filter_row, columns)):
+            filter_index = row_start + offset
+            widget_key = f"board_filter_{board_key}_{filter_index}"
+            with column:
+                if board_filter.filter_type == "dropdown":
+                    options = sorted(
+                        {
+                            str(value)
+                            for value in dataframe[dataframe_column].dropna().tolist()
+                        },
+                        key=str.casefold,
+                    )
+                    selected = st.selectbox(
+                        board_filter.column,
+                        [None, *options],
+                        format_func=lambda value: "All" if value is None else value,
+                        key=widget_key,
+                    )
+                else:
+                    selected = st.text_input(
+                        board_filter.column,
+                        key=widget_key,
+                        placeholder=f"Filter {board_filter.column}...",
+                    ).strip()
+            selected_values.append((board_filter, dataframe_column, selected or None))
+
+    filtered = dataframe
+    for board_filter, dataframe_column, selected in selected_values:
+        if selected is None:
+            continue
+        values = filtered[dataframe_column].astype("string")
+        if board_filter.filter_type == "dropdown":
+            mask = values.eq(selected).fillna(False)
+        else:
+            mask = values.str.contains(re.escape(selected), case=False, na=False, regex=True)
+        filtered = filtered.loc[mask]
+
+    if len(filtered.index) != len(dataframe.index):
+        st.caption(f"Showing {len(filtered.index)} of {len(dataframe.index)} rows.")
+    return filtered
+
+
+def board_dataframe_column_order(board: NoteBoard, dataframe: pd.DataFrame) -> list[str]:
+    available_columns = [str(column) for column in dataframe.columns]
+    if not board.columns:
+        return available_columns
+
+    columns_by_name = {column.casefold(): column for column in available_columns}
+    requested_columns: list[str] = []
+    for requested_column in board.columns:
+        dataframe_column = columns_by_name.get(requested_column.casefold())
+        if dataframe_column is None:
+            st.warning(f"Required board column `{requested_column}` is not present in the CSV.")
+            continue
+        requested_columns.append(dataframe_column)
+
+    requested_names = set(requested_columns)
+    return requested_columns + [
+        column for column in available_columns if column not in requested_names
+    ]
+
+
 def handle_board_action_click(
     click_key: str,
     board: NoteBoard,
@@ -1934,9 +2018,10 @@ def render_note_board(
         st.warning(f"Could not read board data `{board.data_file}`: {exc}")
         return
 
-    display_dataframe = dataframe.copy()
+    filtered_dataframe = render_board_filters(board.filters, dataframe, board_key)
+    display_dataframe = filtered_dataframe.copy()
     column_config: dict[str, object] = {}
-    column_order = list(display_dataframe.columns)
+    column_order = board_dataframe_column_order(board, display_dataframe)
     if controls_enabled:
         for action_index, action in enumerate(board.actions):
             column_name = f"__board_action_{action_index}"
@@ -1949,7 +2034,7 @@ def render_note_board(
                 help=action.instructions,
                 type="secondary",
                 on_click=handle_board_action_click,
-                args=(click_key, board, action, dataframe, project_dir, note_name),
+                args=(click_key, board, action, filtered_dataframe, project_dir, note_name),
                 key=click_key,
             )
     st.dataframe(
