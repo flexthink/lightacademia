@@ -24,8 +24,8 @@
     padding-bottom: 1rem;
 }
 
-.block-container > [data-testid="stVerticalBlock"] {
-    min-height: calc(100vh - 2.55rem);
+.block-container [data-testid="stVerticalBlock"]:has(.st-key-agent_panel) {
+    min-height: calc(100dvh - 2.55rem);
     display: flex;
     flex-direction: column;
 }
@@ -276,28 +276,28 @@ button[kind="primary"]:hover {
     border: 1px solid var(--la-line);
     border-radius: 7px;
     padding: 0.75rem 0.95rem;
-    height: clamp(430px, calc(100vh - 15rem), 1200px) !important;
-    max-height: clamp(430px, calc(100vh - 15rem), 1200px);
+    height: clamp(430px, calc(100dvh - 15rem), 1200px) !important;
+    max-height: clamp(430px, calc(100dvh - 15rem), 1200px);
     overflow-y: auto;
 }
 
 iframe[title="code_editor.code_editor"] {
     background: var(--la-panel);
     border-radius: 7px;
-    height: clamp(430px, calc(100vh - 15rem), 1200px) !important;
-    max-height: clamp(430px, calc(100vh - 15rem), 1200px);
+    height: clamp(430px, calc(100dvh - 15rem), 1200px) !important;
+    max-height: clamp(430px, calc(100dvh - 15rem), 1200px);
 }
 
 div:has(> iframe[title="code_editor.code_editor"]) {
-    height: clamp(430px, calc(100vh - 15rem), 1200px) !important;
-    max-height: clamp(430px, calc(100vh - 15rem), 1200px);
+    height: clamp(430px, calc(100dvh - 15rem), 1200px) !important;
+    max-height: clamp(430px, calc(100dvh - 15rem), 1200px);
 }
 
 body:has(.st-key-agent_panel details[open]) .st-key-preview_pane,
 body:has(.st-key-agent_panel details[open]) iframe[title="code_editor.code_editor"],
 body:has(.st-key-agent_panel details[open]) div:has(> iframe[title="code_editor.code_editor"]) {
-    height: clamp(340px, calc(100vh - 28rem), 430px) !important;
-    max-height: clamp(340px, calc(100vh - 28rem), 430px);
+    height: clamp(340px, calc(100dvh - 25rem), 1200px) !important;
+    max-height: clamp(340px, calc(100dvh - 25rem), 1200px);
 }
 
 .st-key-preview_pane [data-testid="stMarkdownContainer"] {
