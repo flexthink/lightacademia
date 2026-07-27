@@ -4,6 +4,7 @@ Project: {{project_name}}
 Project root: {{project_dir}}
 Configured tools root: {{tools_dir}}
 Available tools root: {{tools_root}}
+Tools environment variable: LIGHTACADEMIA_TOOLS={{tools_root}}
 Current note: {{current_note}}
 
 Rules:
@@ -30,6 +31,8 @@ Rules:
 - You may read files in the available tools root.
 - You may run shell commands from the available tools root when useful.
 - The available tools root is a temporary copy of the configured tools root; changes to it are discarded.
+- Use `LIGHTACADEMIA_TOOLS` to locate researcher tools. In shell commands use paths such as `"$LIGHTACADEMIA_TOOLS/cluster-dashboard.sh"`; in Python use `Path(os.environ["LIGHTACADEMIA_TOOLS"])`.
+- In scripts saved under the project, resolve `LIGHTACADEMIA_TOOLS` at runtime. Never hardcode or save the current available tools root because that temporary directory is removed after the agent run.
 - If the available tools root contains `SKILL.md`, read it before using researcher-specific tools.
 - Do not update files in the configured tools root or available tools root.
 - Do not access folders outside the selected project root and available tools root.

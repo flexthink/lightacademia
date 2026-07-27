@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -28,6 +29,7 @@ class NoteBoard:
     actions: tuple[BoardAction, ...]
     filters: tuple[BoardFilter, ...]
     columns: tuple[str, ...]
+    fetch_mode: str
     data_file: str
     line: int
     end_line: int
@@ -46,6 +48,7 @@ class BoardParseResult:
 
 
 _MARKDOWN = MarkdownIt("commonmark")
+FETCH_HASH_MARKER = "lightacademia-board-fetch-sha256"
 
 
 def normalize_board_name(name: str) -> str:
@@ -55,6 +58,32 @@ def normalize_board_name(name: str) -> str:
 
 def board_data_file(name: str) -> str:
     return f"data/board-{normalize_board_name(name)}.csv"
+
+
+def board_fetch_script(name: str) -> str:
+    return f"code/board-{normalize_board_name(name)}-fetch.py"
+
+
+def board_fetch_hash(board: NoteBoard) -> str:
+    fetch_spec = {
+        "instructions": board.instructions,
+        "columns": list(board.columns),
+        "data_file": board.data_file,
+    }
+    encoded = json.dumps(fetch_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def board_fetch_hash_comment(board: NoteBoard) -> str:
+    return f"# {FETCH_HASH_MARKER}: {board_fetch_hash(board)}"
+
+
+def script_fetch_hash(script: str) -> str | None:
+    match = re.search(
+        rf"(?m)^\s*#\s*{re.escape(FETCH_HASH_MARKER)}:\s*([0-9a-fA-F]{{64}})\s*$",
+        script,
+    )
+    return match.group(1).lower() if match else None
 
 
 def parse_note_boards(markdown: str) -> BoardParseResult:
@@ -93,6 +122,16 @@ def parse_note_boards(markdown: str) -> BoardParseResult:
         if not name:
             errors.append(BoardParseError(block_line, "Board name cannot be empty."))
             continue
+
+        fetch_mode = str(metadata.get("fetch") or "agent").strip().lower()
+        if fetch_mode not in {"agent", "fast"}:
+            errors.append(
+                BoardParseError(
+                    block_line,
+                    f"Board fetch mode `{fetch_mode}` is unsupported; use `fast` or omit it.",
+                )
+            )
+            fetch_mode = "agent"
 
         instructions = "\n".join(lines[separator + 1 :]).strip()
         if not instructions:
@@ -189,6 +228,7 @@ def parse_note_boards(markdown: str) -> BoardParseResult:
                 actions=tuple(parsed_actions),
                 filters=tuple(parsed_filters),
                 columns=tuple(parsed_columns),
+                fetch_mode=fetch_mode,
                 data_file=board_data_file(name),
                 line=block_line,
                 end_line=end_line,
@@ -206,6 +246,20 @@ def build_board_prompt(board: NoteBoard, note_name: str) -> str:
             "Required CSV columns, in this order:\n"
             f"{requested_columns}\n\n"
         )
+    fast_fetch_requirements = ""
+    if board.fetch_mode == "fast":
+        fast_fetch_requirements = (
+            "Fast fetch implementation requirements:\n"
+            f"- Create or update `{board_fetch_script(board.name)}` inside the selected project.\n"
+            "- Include this exact marked comment in the script:\n"
+            f"  `{board_fetch_hash_comment(board)}`\n"
+            "- Implement the fetch instructions in that script. It must run non-interactively "
+            "with Python from the project root and write the board CSV at the exact path above.\n"
+            "- Reuse the project's SKILL.md and researcher tools where appropriate.\n"
+            "- Locate researcher tools through the `LIGHTACADEMIA_TOOLS` environment variable "
+            "at runtime. Never hardcode the current tools directory into the script.\n"
+            "- Run the script now to populate the CSV, and fix the script if that run fails.\n\n"
+        )
     return (
         "Selected note board refresh:\n"
         f"Source note: {note_name}\n"
@@ -219,6 +273,7 @@ def build_board_prompt(board: NoteBoard, note_name: str) -> str:
         "- Do not execute, simulate, or apply any board action to any row. Board actions are "
         "separate commands that run only when the user presses a row action button.\n\n"
         f"{column_requirements}"
+        f"{fast_fetch_requirements}"
         "Output requirements:\n"
         f"- Fetch the board data using the instructions above.\n"
         f"- Write or replace the board CSV at `{board.data_file}` inside the selected project.\n"

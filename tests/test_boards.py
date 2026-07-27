@@ -4,9 +4,13 @@ import unittest
 
 from lightacademia.boards import (
     board_data_file,
+    board_fetch_hash,
+    board_fetch_hash_comment,
+    board_fetch_script,
     build_board_action_prompt,
     build_board_prompt,
     parse_note_boards,
+    script_fetch_hash,
 )
 
 
@@ -64,6 +68,55 @@ class ParseNoteBoardsTest(unittest.TestCase):
         self.assertEqual(len(result.boards), 1)
         self.assertEqual(result.boards[0].filters, ())
         self.assertIn("unsupported type", result.errors[0].message)
+
+    def test_builds_fast_fetch_script_instructions_with_hash(self) -> None:
+        result = parse_note_boards(
+            """```board
+name: Recent Runs
+fetch: fast
+columns:
+- Name
+- Accuracy
+
+Fetch recent runs.
+```
+"""
+        )
+        board = result.boards[0]
+
+        self.assertEqual(board.fetch_mode, "fast")
+        self.assertEqual(board_fetch_script(board.name), "code/board-recent-runs-fetch.py")
+        marker = board_fetch_hash_comment(board)
+        self.assertEqual(script_fetch_hash(f"#!/usr/bin/env python\n{marker}\n"), board_fetch_hash(board))
+        prompt = build_board_prompt(board, "Runs.md")
+        self.assertIn("Fast fetch implementation requirements:", prompt)
+        self.assertIn("code/board-recent-runs-fetch.py", prompt)
+        self.assertIn(marker, prompt)
+        self.assertIn("LIGHTACADEMIA_TOOLS", prompt)
+        self.assertIn("Never hardcode", prompt)
+        self.assertIn("Run the script now", prompt)
+
+        changed = parse_note_boards(
+            """```board
+name: Recent Runs
+fetch: fast
+columns:
+- Name
+- Accuracy
+
+Fetch all recent runs.
+```
+"""
+        ).boards[0]
+        self.assertNotEqual(board_fetch_hash(board), board_fetch_hash(changed))
+
+    def test_reports_unsupported_fetch_mode_and_uses_agent_fetch(self) -> None:
+        result = parse_note_boards(
+            "```board\nname: Runs\nfetch: instant\n\nFetch runs.\n```\n"
+        )
+
+        self.assertEqual(result.boards[0].fetch_mode, "agent")
+        self.assertIn("fetch mode", result.errors[0].message)
 
     def test_builds_refresh_prompt_with_context(self) -> None:
         board = parse_note_boards(BOARD_MARKDOWN).boards[0]

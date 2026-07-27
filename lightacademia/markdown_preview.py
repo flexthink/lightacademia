@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlencode, urlsplit
+from urllib.parse import unquote, urlsplit
 
 from markdown_it import MarkdownIt
 from tabulate import tabulate
 import yaml
+
+from lightacademia.routing import workspace_hash
 
 
 SUPPORTED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
@@ -115,8 +117,7 @@ def rewrite_project_note_links(markdown: str, project_dir: Path) -> tuple[str, t
         except ProjectNoteLinkError as exc:
             errors.append(str(exc))
             continue
-        query = urlencode({"project": project_dir.name, "note": note_name})
-        replacements[link.target] = f"?{query}"
+        replacements[link.target] = workspace_hash(project_dir.name, note_name)
 
     if not replacements:
         return markdown, tuple(dict.fromkeys(errors))

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lightacademia.git_ops import (
+    git_commit_all,
     git_file_at_revision,
     git_file_history,
     git_set_remote_url,
@@ -15,6 +16,33 @@ from lightacademia.git_ops import (
 
 
 class GitFileHistoryTest(unittest.TestCase):
+    @patch("lightacademia.git_ops.Path.exists", return_value=True)
+    @patch("lightacademia.git_ops.run_git")
+    def test_commit_does_not_stage_when_repository_is_clean(self, run_git, exists) -> None:
+        run_git.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        self.assertFalse(git_commit_all(Path("/project"), "Checkpoint"))
+
+        run_git.assert_called_once_with(Path("/project"), "status", "--porcelain", check=False)
+
+    @patch("lightacademia.git_ops.Path.exists", return_value=True)
+    @patch("lightacademia.git_ops.run_git")
+    def test_commit_rechecks_changes_while_holding_repository_lock(self, run_git, exists) -> None:
+        run_git.side_effect = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=" M Home.md\n", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ]
+
+        self.assertFalse(git_commit_all(Path("/project"), "Checkpoint"))
+
+        self.assertEqual(
+            [call.args for call in run_git.call_args_list],
+            [
+                (Path("/project"), "status", "--porcelain"),
+                (Path("/project"), "status", "--porcelain"),
+            ],
+        )
+
     @patch("lightacademia.git_ops.Path.exists", return_value=True)
     @patch("lightacademia.git_ops.run_git")
     def test_reads_file_revisions(self, run_git, exists) -> None:

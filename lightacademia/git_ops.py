@@ -3,11 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import subprocess
+import threading
 from pathlib import Path
 
 
 class GitError(RuntimeError):
     pass
+
+
+_repo_locks_guard = threading.Lock()
+_repo_locks: dict[Path, threading.RLock] = {}
+
+
+def repo_git_lock(project_dir: Path) -> threading.RLock:
+    repository = project_dir.resolve()
+    with _repo_locks_guard:
+        return _repo_locks.setdefault(repository, threading.RLock())
 
 
 @dataclass(frozen=True)
@@ -56,18 +67,24 @@ def git_status_lines(project_dir: Path) -> list[str]:
 def git_commit_all(project_dir: Path, message: str) -> bool:
     if not (project_dir / ".git").exists():
         return False
-    run_git(project_dir, "add", "-A")
     if not git_has_changes(project_dir):
         return False
-    run_git(project_dir, "commit", "-m", message)
-    return True
+    with repo_git_lock(project_dir):
+        if not git_has_changes(project_dir):
+            return False
+        run_git(project_dir, "add", "-A")
+        if not git_has_changes(project_dir):
+            return False
+        run_git(project_dir, "commit", "-m", message)
+        return True
 
 
 def git_stage_all(project_dir: Path) -> bool:
     if not (project_dir / ".git").exists():
         return False
-    run_git(project_dir, "add", "-A")
-    return True
+    with repo_git_lock(project_dir):
+        run_git(project_dir, "add", "-A")
+        return True
 
 
 def git_remote_url(project_dir: Path, name: str = "origin") -> str | None:
@@ -149,6 +166,11 @@ class GitSyncResult:
 
 
 def git_sync(project_dir: Path, remote: str = "origin") -> GitSyncResult:
+    with repo_git_lock(project_dir):
+        return _git_sync_locked(project_dir, remote)
+
+
+def _git_sync_locked(project_dir: Path, remote: str) -> GitSyncResult:
     if git_remote_url(project_dir, remote) is None:
         raise GitError("No remote URL configured.")
 

@@ -10,9 +10,12 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import queue
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -43,9 +46,12 @@ from lightacademia.boards import (
     BoardAction,
     BoardFilter,
     NoteBoard,
+    board_fetch_hash,
+    board_fetch_script,
     build_board_action_prompt,
     build_board_prompt,
     parse_note_boards,
+    script_fetch_hash,
 )
 from lightacademia.chat import append_chat_entry, list_chat_log_dates, read_chat_log
 from lightacademia.git_ops import (
@@ -71,6 +77,7 @@ from lightacademia.markdown_preview import (
     resolve_project_image,
     rewrite_project_note_links,
 )
+from lightacademia.routing import WorkspaceRoute
 from lightacademia.search import SearchUnavailable, search_notes
 from lightacademia.storage import (
     HOME_NOTE,
@@ -115,8 +122,8 @@ COPY_IMAGE_BUTTON_CSS_PATH = Path("assets/copy_image_button.css")
 COPY_TABLE_BUTTONS_CSS_PATH = Path("assets/copy_table_buttons.css")
 WORKSPACE_TREE_CSS_PATH = Path("assets/workspace_tree.css")
 WORKSPACE_TREE_JS_PATH = Path("assets/workspace_tree.js")
-PROJECT_QUERY_PARAM = "project"
-NOTE_QUERY_PARAM = "note"
+WORKSPACE_NAVIGATION_CSS_PATH = Path("assets/workspace_navigation.css")
+WORKSPACE_NAVIGATION_JS_PATH = Path("assets/workspace_navigation.js")
 RESIZABLE_COLUMNS_COMPONENT = "streamlit-extras.resizable_columns"
 MARKDOWN_SUFFIXES = {".md", ".markdown"}
 TEXT_SUFFIXES = {
@@ -302,6 +309,64 @@ def workspace_tree_component():
     )
 
 
+@lru_cache(maxsize=1)
+def workspace_navigation_component():
+    css = (
+        WORKSPACE_NAVIGATION_CSS_PATH.read_text(encoding="utf-8")
+        if WORKSPACE_NAVIGATION_CSS_PATH.exists()
+        else ""
+    )
+    js = (
+        WORKSPACE_NAVIGATION_JS_PATH.read_text(encoding="utf-8")
+        if WORKSPACE_NAVIGATION_JS_PATH.exists()
+        else ""
+    )
+    return st.components.v2.component(
+        "light_academia_workspace_navigation",
+        html='<div class="la-workspace-navigation"></div>',
+        css=css,
+        js=js,
+    )
+
+
+def workspace_navigation_route(
+    *,
+    mode: str,
+    project_name: str,
+    note_name: str | None,
+    key: str,
+    projects: list[dict[str, str]] | None = None,
+    notes: list[dict[str, str]] | None = None,
+) -> WorkspaceRoute:
+    pending_route = st.session_state.pop("pending_hash_route", None)
+    result = workspace_navigation_component()(
+        key=key,
+        data={
+            "mode": mode,
+            "project": project_name,
+            "note": note_name or "",
+            "projects": projects or [],
+            "notes": notes or [],
+            "pushRoute": pending_route or {},
+        },
+        default={"route": {"project": project_name, "note": note_name or ""}},
+        on_route_change=lambda: None,
+    )
+    if mode != "projects":
+        return WorkspaceRoute(project_name, note_name)
+    if not isinstance(result, dict):
+        return WorkspaceRoute(project_name, note_name)
+    route = result.get("route")
+    if not isinstance(route, dict):
+        return WorkspaceRoute(project_name, note_name)
+    selected_project = route.get("project")
+    selected_note = route.get("note")
+    return WorkspaceRoute(
+        selected_project if isinstance(selected_project, str) and selected_project else project_name,
+        selected_note if isinstance(selected_note, str) and selected_note else None,
+    )
+
+
 def workspace_tree_selection(
     tree: dict[str, object],
     selected: str | None,
@@ -457,7 +522,7 @@ def new_project_dialog(notebook_dir: Path) -> None:
             project = create_project(notebook_dir, title)
             st.session_state.project_name = project.name
             st.session_state.note_name = HOME_NOTE
-            set_selection_query(project.name, HOME_NOTE)
+            queue_hash_route(project.name, HOME_NOTE)
             st.session_state.editor_revision += 1
             st.rerun()
         except (OSError, GitError) as exc:
@@ -474,7 +539,7 @@ def archive_project_dialog(notebook_dir: Path, project: Project, current_note_to
             archive_project(notebook_dir, project)
             st.session_state.project_name = None
             st.session_state.note_name = None
-            set_selection_query(None)
+            queue_hash_route(None)
             st.session_state.editor_revision += 1
             st.rerun()
         except (OSError, GitError) as exc:
@@ -496,7 +561,7 @@ def settings_dialog(project: Project, note) -> None:
                 save_editor_state(note)
                 renamed = rename_note(project, note, note_title)
                 st.session_state.note_name = renamed.name
-                set_selection_query(project.name, renamed.name)
+                queue_hash_route(project.name, renamed.name)
                 st.session_state.editor_revision += 1
             git_set_remote_url(project.path, remote_url)
             st.session_state.last_sync_error = None
@@ -515,7 +580,7 @@ def new_note_dialog(project: Project) -> None:
             return
         note = create_note(project, title)
         st.session_state.note_name = note.name
-        set_selection_query(project.name, note.name)
+        queue_hash_route(project.name, note.name)
         st.session_state.editor_revision += 1
         st.rerun()
 
@@ -528,7 +593,7 @@ def archive_note_dialog(project: Project, note) -> None:
             save_editor_state(note)
             archive_note(project, note)
             st.session_state.note_name = HOME_NOTE
-            set_selection_query(project.name, HOME_NOTE)
+            queue_hash_route(project.name, HOME_NOTE)
             st.session_state.editor_revision += 1
             st.rerun()
         except (OSError, GitError) as exc:
@@ -879,52 +944,33 @@ def init_state() -> None:
         "tool_history_revision": None,
         "tool_history_path": None,
         "tool_history_label": None,
+        "pending_hash_route": None,
+        "navigation_revision": 0,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
 
-def query_param_value(key: str) -> str | None:
-    value = st.query_params.get(key)
-    if isinstance(value, list):
-        return value[0] if value else None
-    return value if isinstance(value, str) and value else None
+def queue_hash_route(project_name: str | None, note_name: str | None = None) -> None:
+    st.session_state.pending_hash_route = (
+        {"project": project_name, "note": note_name or ""}
+        if project_name
+        else None
+    )
+    st.session_state.navigation_revision += 1
 
 
-def hydrate_selection_from_query(projects: list[Project]) -> None:
-    requested_project = query_param_value(PROJECT_QUERY_PARAM)
-    if not requested_project:
-        return
-
-    projects_by_name = {project.name: project for project in projects}
-    project = projects_by_name.get(requested_project)
+def resolved_workspace_route(route: WorkspaceRoute, projects: list[Project]) -> WorkspaceRoute | None:
+    project = next((item for item in projects if item.name == route.project), None)
     if project is None:
-        return
-
-    st.session_state.project_name = project.name
-    requested_note = query_param_value(NOTE_QUERY_PARAM)
-    if not requested_note:
-        return
-
-    note_names = {note.name for note in list_notes(project)}
-    if requested_note in note_names:
-        st.session_state.note_name = requested_note
-
-
-def set_selection_query(project_name: str | None, note_name: str | None = None) -> None:
-    if not project_name:
-        st.query_params.clear()
-        return
-    updates = {PROJECT_QUERY_PARAM: project_name}
-    if note_name:
-        updates[NOTE_QUERY_PARAM] = note_name
-    if dict(st.query_params) != updates:
-        st.query_params.clear()
-        st.query_params.update(updates)
-
-
-def sync_selection_to_query(project: Project, note_name: str | None) -> None:
-    set_selection_query(project.name, note_name)
+        return None
+    note_names = [note.name for note in list_notes(project)]
+    if not note_names:
+        return WorkspaceRoute(project.name, None)
+    note_name = route.note if route.note in note_names else None
+    if note_name is None:
+        note_name = HOME_NOTE if HOME_NOTE in note_names else note_names[0]
+    return WorkspaceRoute(project.name, note_name)
 
 
 def active_history_revision(note) -> str | None:
@@ -986,8 +1032,9 @@ def commit_if_idle(project: Project, autocommit_seconds: int) -> None:
         return
     if time.time() - last_edit_at < autocommit_seconds:
         return
-    if git_commit_all(project.path, "Autosave checkpoint"):
-        st.session_state.last_commit_at = time.time()
+    committed = git_commit_all(project.path, "Autosave checkpoint")
+    st.session_state.last_commit_at = time.time()
+    if committed:
         st.toast("Autosave checkpoint committed")
 
 
@@ -1063,8 +1110,9 @@ def commit_tools_if_idle(tools_dir: Path, autocommit_seconds: int) -> None:
         return
     if time.time() - last_edit_at < autocommit_seconds:
         return
-    if git_commit_tools_text_files(tools_dir, "Autosave tools checkpoint"):
-        st.session_state.tool_last_commit_at = time.time()
+    committed = git_commit_tools_text_files(tools_dir, "Autosave tools checkpoint")
+    st.session_state.tool_last_commit_at = time.time()
+    if committed:
         st.toast("Tools checkpoint committed")
 
 
@@ -1354,8 +1402,20 @@ def build_tools_tree(tools_dir: Path) -> dict[str, object]:
     return tree
 
 
-def build_notes_tree(notes) -> dict[str, object]:
-    return {note.name: None for note in notes}
+def project_navigation_items(projects: list[Project]) -> list[dict[str, str]]:
+    items = []
+    for project in projects:
+        notes = list_notes(project)
+        note_names = [note.name for note in notes]
+        default_note = HOME_NOTE if HOME_NOTE in note_names else (note_names[0] if note_names else "")
+        items.append(
+            {
+                "name": project.name,
+                "label": project.name,
+                "defaultNote": default_note,
+            }
+        )
+    return items
 
 
 def resolve_tool_tree_selection(tools_dir: Path, selected: str | None) -> Path | None:
@@ -1462,10 +1522,13 @@ def commit_before_navigation(
     current_note_to_save=None,
     next_project: str | None = None,
     next_note: str | None = None,
+    hash_updated: bool = False,
 ) -> None:
-    if current_note_to_save is not None:
-        save_editor_state(current_note_to_save)
-    if git_commit_all(project.path, "Checkpoint before navigation"):
+    note_changed = (
+        current_note_to_save is not None
+        and save_editor_state(current_note_to_save)
+    )
+    if note_changed and git_commit_all(project.path, "Checkpoint before navigation"):
         st.session_state.last_commit_at = time.time()
     if next_project is not None:
         st.session_state.project_name = next_project
@@ -1474,10 +1537,11 @@ def commit_before_navigation(
     clear_history_revision()
     st.session_state.requested_action = None
     st.session_state.queued_agent_prompt = None
-    set_selection_query(
-        next_project or project.name,
-        next_note if next_note is not None else (None if next_project is not None else st.session_state.note_name),
-    )
+    if not hash_updated:
+        queue_hash_route(
+            next_project or project.name,
+            next_note if next_note is not None else st.session_state.note_name,
+        )
     st.session_state.editor_revision += 1
     st.rerun()
 
@@ -1944,6 +2008,61 @@ def board_dataframe_column_order(board: NoteBoard, dataframe: pd.DataFrame) -> l
     ]
 
 
+def current_fast_fetch_script(board: NoteBoard, project_dir: Path) -> Path | None:
+    script_path = (project_dir.resolve() / board_fetch_script(board.name)).resolve()
+    if not script_path.is_relative_to(project_dir.resolve()) or not script_path.is_file():
+        return None
+    try:
+        script_hash = script_fetch_hash(script_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+    return script_path if script_hash == board_fetch_hash(board) else None
+
+
+def run_fast_board_fetch(board: NoteBoard, project_dir: Path, script_path: Path) -> None:
+    config = get_config()
+    relative_script = script_path.relative_to(project_dir.resolve())
+    environment = os.environ.copy()
+    environment["LIGHTACADEMIA_TOOLS"] = str(config.tools_dir.resolve())
+    with st.spinner(f"Refreshing {board.name}..."):
+        try:
+            result = subprocess.run(
+                [sys.executable, str(relative_script)],
+                cwd=project_dir.resolve(),
+                capture_output=True,
+                text=True,
+                timeout=config.agent_timeout_seconds,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            st.session_state.last_agent_error = f"Fast fetch failed: {exc}"
+            return
+
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "No output.").strip()
+        st.session_state.last_agent_error = (
+            f"Fast fetch failed with exit code {result.returncode}:\n\n"
+            f"```\n{details[-4000:]}\n```"
+        )
+        return
+
+    csv_path = (project_dir.resolve() / board.data_file).resolve()
+    if not csv_path.is_file():
+        st.session_state.last_agent_error = (
+            f"Fast fetch completed but did not create `{board.data_file}`."
+        )
+        return
+
+    try:
+        if git_commit_all(project_dir.resolve(), f"Refresh board {board.name}"):
+            st.session_state.last_commit_at = time.time()
+    except GitError as exc:
+        st.session_state.last_agent_error = f"Fast fetch succeeded, but its changes could not be committed: {exc}"
+        return
+    st.session_state.last_agent_error = None
+
+
 def handle_board_action_click(
     click_key: str,
     board: NoteBoard,
@@ -1994,12 +2113,20 @@ def render_note_board(
         icon=":material/refresh:",
         help="Refresh this board",
     ):
-        start_board_agent_command(
-            build_board_prompt(board, note_name),
-            project_dir,
-            note_name,
-            operation="board refresh",
+        fast_script = (
+            current_fast_fetch_script(board, project_dir)
+            if board.fetch_mode == "fast"
+            else None
         )
+        if fast_script is not None:
+            run_fast_board_fetch(board, project_dir, fast_script)
+        else:
+            start_board_agent_command(
+                build_board_prompt(board, note_name),
+                project_dir,
+                note_name,
+                operation="board refresh",
+            )
         st.rerun(scope="app")
     with st.expander("Fetch instructions", expanded=False):
         st.markdown(board.instructions)
@@ -2389,8 +2516,6 @@ def main() -> None:
     except (OSError, GitError) as exc:
         st.error(f"Could not open workspace folders: {exc}")
         return
-    hydrate_selection_from_query(projects)
-
     if st.session_state.get("workspace_view") == "tools":
         try:
             commit_tools_if_idle(tools_dir, config.autocommit_seconds)
@@ -2441,13 +2566,14 @@ def main() -> None:
             st.rerun()
         st.divider()
 
-        project_names = [item.name for item in projects]
         project_header, project_new, project_archive = st.columns([0.66, 0.17, 0.17], vertical_alignment="bottom")
         with project_header:
-            selected_project = st.selectbox(
-                "Projects",
-                project_names,
-                index=project_names.index(project.name),
+            selected_route = workspace_navigation_route(
+                mode="projects",
+                project_name=project.name,
+                note_name=note_before_project_navigation.name if note_before_project_navigation else None,
+                key=f"project_navigation_{st.session_state.navigation_revision}",
+                projects=project_navigation_items(projects),
             )
         with project_new:
             if st.button(
@@ -2465,12 +2591,27 @@ def main() -> None:
                 icon=":material/archive:",
             ):
                 archive_project_dialog(notebook_dir, project, note_before_project_navigation)
-        if selected_project != project.name:
+        resolved_route = resolved_workspace_route(selected_route, projects)
+        if resolved_route is None:
+            queue_hash_route(
+                project.name,
+                note_before_project_navigation.name if note_before_project_navigation else None,
+            )
+            st.rerun()
+        if (
+            resolved_route.project != project.name
+            or (
+                resolved_route.note is not None
+                and note_before_project_navigation is not None
+                and resolved_route.note != note_before_project_navigation.name
+            )
+        ):
             commit_before_navigation(
                 project,
                 current_note_to_save=note_before_project_navigation,
-                next_project=selected_project,
-                next_note=None,
+                next_project=resolved_route.project,
+                next_note=resolved_route.note,
+                hash_updated=True,
             )
 
         st.divider()
@@ -2488,27 +2629,42 @@ def main() -> None:
         render_app_header()
         st.info("Create a note to get started.")
         return
-    sync_selection_to_query(project, note.name)
 
     with st.sidebar:
         st.markdown("### Notes")
-        note_tree = build_notes_tree(notes)
-        selected_note = workspace_tree_selection(
-            note_tree,
-            note.name,
-            key=f"notes_tree_{project.path.resolve()}_{st.session_state.workspace_tree_revision}",
-            tree_id=f"notes:{project.path.resolve()}",
-            labels={item.name: note_display_name(item.name) for item in notes},
-            icons={
-                item.name: "wrench" if item.name.casefold() == "skill.md" else "note"
+        selected_route = workspace_navigation_route(
+            mode="notes",
+            project_name=project.name,
+            note_name=note.name,
+            key=f"note_navigation_{project.path.resolve()}_{st.session_state.navigation_revision}",
+            notes=[
+                {
+                    "name": item.name,
+                    "label": note_display_name(item.name),
+                    "icon": "wrench" if item.name.casefold() == "skill.md" else "note",
+                }
                 for item in notes
-            },
-            pinned_last=tuple(
-                item.name for item in notes if item.name.casefold() == "skill.md"
-            ),
+            ],
         )
-        if selected_note and selected_note != note.name:
-            commit_before_navigation(project, current_note_to_save=note, next_note=selected_note)
+        resolved_route = resolved_workspace_route(selected_route, projects)
+        if resolved_route is None or resolved_route.project != project.name:
+            if resolved_route is None:
+                queue_hash_route(project.name, note.name)
+                st.rerun()
+            commit_before_navigation(
+                project,
+                current_note_to_save=note,
+                next_project=resolved_route.project,
+                next_note=resolved_route.note,
+                hash_updated=True,
+            )
+        if resolved_route.note and resolved_route.note != note.name:
+            commit_before_navigation(
+                project,
+                current_note_to_save=note,
+                next_note=resolved_route.note,
+                hash_updated=True,
+            )
 
         st.divider()
         search_key = f"note_search_{project.name}"

@@ -173,11 +173,11 @@ class MarkdownTableTest(unittest.TestCase):
 
 
 class RewriteProjectNoteLinksTest(unittest.TestCase):
-    def test_rewrites_root_note_links_to_query_params(self) -> None:
+    def test_rewrites_root_note_links_to_hash_routes(self) -> None:
         markdown, errors = rewrite_project_note_links("See [Spec](PRD.md).\n", PROJECT_ROOT)
 
         self.assertEqual(errors, ())
-        self.assertIn("[Spec](?project=lightacademia&note=PRD.md)", markdown)
+        self.assertIn("[Spec](#/project/lightacademia/note/PRD.md)", markdown)
 
     def test_does_not_rewrite_code_or_images(self) -> None:
         source = "Inline `[Spec](PRD.md)` and ![Spec](PRD.md), then [Spec](PRD.md).\n"
@@ -187,7 +187,7 @@ class RewriteProjectNoteLinksTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertIn("`[Spec](PRD.md)`", markdown)
         self.assertIn("![Spec](PRD.md)", markdown)
-        self.assertIn("[Spec](?project=lightacademia&note=PRD.md)", markdown)
+        self.assertIn("[Spec](#/project/lightacademia/note/PRD.md)", markdown)
 
     def test_reports_missing_note_links(self) -> None:
         markdown, errors = rewrite_project_note_links("See [Missing](Missing.md).\n", PROJECT_ROOT)

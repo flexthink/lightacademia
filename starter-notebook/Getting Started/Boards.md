@@ -1,9 +1,10 @@
 # Boards
 
-Boards display agent-fetched CSV data as interactive tables. Press **Refresh: MNIST Experiments** below to ask the Robot to generate the sample data.
+Boards display fetched CSV data as interactive tables. This example uses fast fetch: the first refresh asks the Robot to create a reusable fetch script, while later refreshes run that script directly. Editing the fetch instructions or columns asks the Robot to update the script.
 
 ```board
 name: MNIST Experiments
+fetch: fast
 filters:
 - Name
 - Architecture: dropdown

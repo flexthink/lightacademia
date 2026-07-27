@@ -54,6 +54,27 @@ class CodexProgressTest(unittest.TestCase):
 
         self.assertIn("sandbox_workspace_write.network_access=true", command)
 
+    def test_builds_runtime_tools_environment(self) -> None:
+        agent = CodexCliAgent()
+
+        environment = agent._build_environment(Path("/temporary/tools"))
+
+        self.assertEqual(environment["LIGHTACADEMIA_TOOLS"], "/temporary/tools")
+
+    def test_prompt_requires_runtime_tools_environment(self) -> None:
+        agent = CodexCliAgent()
+        context = AgentContext(
+            project_dir=Path("/project"),
+            project_name="project",
+            tools_dir=Path("/tools"),
+            current_note="Home.md",
+        )
+
+        prompt = agent._build_prompt("Refresh the board.", context, Path("/temporary/tools"))
+
+        self.assertIn("LIGHTACADEMIA_TOOLS=/temporary/tools", prompt)
+        self.assertIn("Never hardcode or save the current available tools root", prompt)
+
     def test_claude_command_uses_stream_json_print_mode(self) -> None:
         agent = ClaudeCliAgent()
         context = AgentContext(
@@ -154,6 +175,7 @@ class CodexProgressTest(unittest.TestCase):
     def test_streams_jsonl_subprocess_without_model_call(self) -> None:
         script = """
 import json
+import os
 import sys
 
 sys.stdin.read()
@@ -161,7 +183,7 @@ events = [
     {"type": "turn.started"},
     {"type": "item.completed", "item": {"type": "reasoning", "text": "Checking files."}},
     {"type": "item.started", "item": {"type": "command_execution", "command": "ls"}},
-    {"type": "item.completed", "item": {"type": "agent_message", "text": "Done."}},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": os.environ["LIGHTACADEMIA_TOOLS"]}},
 ]
 for event in events:
     print(json.dumps(event), flush=True)
@@ -174,10 +196,11 @@ print("diagnostic", file=sys.stderr, flush=True)
             [sys.executable, "-u", "-c", script],
             "test prompt",
             progress.append,
+            environment=agent._build_environment(Path("/temporary/tools")),
         )
 
         self.assertEqual(result["returncode"], 0)
-        self.assertEqual(result["last_agent_message"], "Done.")
+        self.assertEqual(result["last_agent_message"], "/temporary/tools")
         self.assertEqual(result["tool_actions"], ["ls"])
         self.assertIn("diagnostic", result["stderr"])
         self.assertTrue(any("Checking files" in item.text for item in progress))
@@ -185,6 +208,7 @@ print("diagnostic", file=sys.stderr, flush=True)
     def test_streams_claude_jsonl_subprocess_without_model_call(self) -> None:
         script = """
 import json
+import os
 import sys
 
 sys.stdin.read()
@@ -194,7 +218,7 @@ events = [
         {"type": "text", "text": "Checking files."},
         {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
     ]}},
-    {"type": "result", "result": "Done."},
+    {"type": "result", "result": os.environ["LIGHTACADEMIA_TOOLS"]},
 ]
 for event in events:
     print(json.dumps(event), flush=True)
@@ -207,10 +231,11 @@ print("diagnostic", file=sys.stderr, flush=True)
             [sys.executable, "-u", "-c", script],
             "test prompt",
             progress.append,
+            environment=agent._build_environment(Path("/temporary/tools")),
         )
 
         self.assertEqual(result["returncode"], 0)
-        self.assertEqual(result["last_agent_message"], "Done.")
+        self.assertEqual(result["last_agent_message"], "/temporary/tools")
         self.assertEqual(result["tool_actions"], ["ls"])
         self.assertIn("diagnostic", result["stderr"])
         self.assertTrue(any("Checking files" in item.text for item in progress))

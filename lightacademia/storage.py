@@ -169,7 +169,14 @@ def archive_project(notebook_dir: Path, project: Project) -> Path:
 
 def list_notes(project: Project) -> list[Note]:
     notes = []
-    for path in sorted(project.path.glob("*.md"), key=lambda p: (p.name != HOME_NOTE, p.name.lower())):
+    for path in sorted(
+        project.path.glob("*.md"),
+        key=lambda p: (
+            p.name != HOME_NOTE,
+            p.name.casefold() == "skill.md",
+            p.name.casefold(),
+        ),
+    ):
         if path.is_file():
             notes.append(Note(path.name, path))
     return notes

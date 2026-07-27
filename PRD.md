@@ -165,12 +165,15 @@ Add the results to this note.
 ## Note Boards
 - A note may define agent-refreshed data boards in fenced Markdown blocks with the language `board`
 - Board discovery and parsing are local and do not require an LLM call
-- A board has a required `name`, optional YAML lists of `actions`, `filters`, and `columns`, a blank separator, and fetch instructions
+- A board has a required `name`, optional `fetch` mode, optional YAML lists of `actions`, `filters`, and `columns`, a blank separator, and fetch instructions
 - `columns` defines the required CSV column names and display order and is included in the board refresh instructions sent to the agent
 - A bare filter column uses a case-insensitive text filter; a filter mapped to `dropdown` uses the distinct CSV values
 - `text` and `dropdown` are the supported board filter types
 - Board data is stored at `data/board-{normalized board name}.csv` inside the current project
-- The preview displays a Refresh button that immediately runs the agent with the source note, board name, board data file, and fetch instructions; action definitions are excluded and the prompt explicitly prohibits executing board actions
+- The default fetch mode runs the agent on every refresh with the source note, board name, board data file, and fetch instructions; action definitions are excluded and the prompt explicitly prohibits executing board actions
+- With `fetch: fast`, the agent creates a deterministic script at `code/board-{normalized board name}-fetch.py`, marks it with a hash of the fetch instructions, required columns, and output path, and runs it to populate the CSV
+- Later fast refreshes run that script directly while its marked hash matches; missing or stale scripts invoke the agent to create or update the script
+- A successful direct fast refresh is committed by the application; script failures are displayed as warnings and leave the previous board data available
 - When its CSV exists, the board renders it with `st.dataframe`
 - Each board action is displayed as a `ButtonColumn` for every CSV row
 - Clicking a row action immediately runs the agent with a prompt containing the selected row, source note, board name, board data file, action name, and action instructions
@@ -182,6 +185,7 @@ Example:
 ````markdown
 ```board
 name: Experiments
+fetch: fast
 actions:
 - Resume: Resume the selected experiment
 - Troubleshoot: Tail the log file and summarize the findings
@@ -222,6 +226,9 @@ Fetch experiments from the cluster that have run within the last week.
     - If the selected project contains `SKILL.md`, the agent should use it as guidance for project-specific tool usage
     - The agent may read files from a temporary copy of the configured tools folder
     - The agent may run shell commands from a temporary copy of the configured tools folder
+    - Agent processes receive `LIGHTACADEMIA_TOOLS` pointing to the available tools copy
+    - Persistent project scripts must resolve `LIGHTACADEMIA_TOOLS` at runtime and must not hardcode the temporary tools-copy path
+    - When the application runs a persistent project script, `LIGHTACADEMIA_TOOLS` points to the configured persistent tools folder
     - If the tools folder contains `SKILL.md`, the agent should use it as guidance for available researcher-specific tools
     - The agent may not update the tools folder
     - The agent may not access folders outside the selected project and temporary tools copy

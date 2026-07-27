@@ -12,12 +12,26 @@ from lightacademia.storage import (
     create_note,
     create_project,
     initialize_notebook,
+    list_notes,
     rename_note,
     safe_name,
 )
 
 
 class StorageNamesTest(unittest.TestCase):
+    def test_notes_put_home_first_and_skill_last(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory)
+            for name in ("SKILL.md", "Zebra.md", "Home.md", "Alpha.md"):
+                (project_path / name).write_text("", encoding="utf-8")
+
+            notes = list_notes(Project("Research", project_path))
+
+            self.assertEqual(
+                [note.name for note in notes],
+                ["Home.md", "Alpha.md", "Zebra.md", "SKILL.md"],
+            )
+
     def test_safe_name_preserves_spaces(self) -> None:
         self.assertEqual(safe_name("My Research Notebook"), "My Research Notebook")
         self.assertEqual(safe_name("  Ablation   Results  "), "Ablation Results")

@@ -6,6 +6,8 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
+from lightacademia.boards import board_fetch_hash_comment, parse_note_boards
+
 
 class BoardRenderTest(unittest.TestCase):
     def test_renders_board_dataframe_with_action_column(self) -> None:
@@ -53,6 +55,55 @@ render_note_board(board, Path({str(project_dir)!r}), "Experiments.md", "test", 0
 
             self.assertEqual(list(app_test.exception), [])
             self.assertEqual(app_test.dataframe[0].value["Name"].tolist(), ["run-2"])
+
+    def test_matching_fast_fetch_script_runs_without_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+            (project_dir / "data").mkdir()
+            (project_dir / "code").mkdir()
+            csv_path = project_dir / "data" / "board-demo-fetch.csv"
+            csv_path.write_text("Name,Accuracy\nold,0.50\n", encoding="utf-8")
+            board_markdown = """```board
+name: Demo Fetch
+fetch: fast
+columns:
+- Name
+- Accuracy
+
+Generate demo rows.
+```
+"""
+            board = parse_note_boards(board_markdown).boards[0]
+            script_path = project_dir / "code" / "board-demo-fetch-fetch.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "from pathlib import Path",
+                        board_fetch_hash_comment(board),
+                        'assert os.environ["LIGHTACADEMIA_TOOLS"]',
+                        'Path("data/board-demo-fetch.csv").write_text(',
+                        '    "Name,Accuracy\\nnew,0.99\\n", encoding="utf-8"',
+                        ")",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            script = f'''\
+from pathlib import Path
+from app import render_note_board
+from lightacademia.boards import parse_note_boards
+
+board = parse_note_boards({board_markdown!r}).boards[0]
+render_note_board(board, Path({str(project_dir)!r}), "Demo.md", "fast-test", 0, True)
+'''
+
+            app_test = AppTest.from_string(script).run()
+            app_test.button[0].click().run()
+
+            self.assertEqual(list(app_test.exception), [])
+            self.assertEqual(csv_path.read_text(encoding="utf-8"), "Name,Accuracy\nnew,0.99\n")
 
 
 if __name__ == "__main__":

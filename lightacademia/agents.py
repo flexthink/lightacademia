@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -101,6 +102,7 @@ class CodexCliAgent:
                 self._build_prompt(prompt, context, tools_workspace),
                 on_progress,
                 should_stop,
+                environment=self._build_environment(tools_workspace),
             )
             response = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
             if result["returncode"] != 0:
@@ -154,6 +156,7 @@ class CodexCliAgent:
         prompt: str,
         on_progress: ProgressCallback | None,
         should_stop: StopCallback | None = None,
+        environment: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         process = subprocess.Popen(
             command,
@@ -162,6 +165,7 @@ class CodexCliAgent:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=environment,
         )
         assert process.stdin is not None
         assert process.stdout is not None
@@ -297,6 +301,11 @@ class CodexCliAgent:
             template = template.replace(placeholder, value)
         return template
 
+    def _build_environment(self, tools_root: Path) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment["LIGHTACADEMIA_TOOLS"] = str(tools_root.resolve())
+        return environment
+
     def _copy_tools_dir(self, source: Path, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
         if not source.exists():
@@ -352,6 +361,7 @@ class ClaudeCliAgent(CodexCliAgent):
                 on_progress,
                 should_stop,
                 cwd=context.project_dir,
+                environment=self._build_environment(tools_workspace),
             )
             if result["returncode"] != 0:
                 detail = result["stderr"].strip() or result["error"].strip() or "Claude CLI failed."
@@ -398,6 +408,7 @@ class ClaudeCliAgent(CodexCliAgent):
         on_progress: ProgressCallback | None,
         should_stop: StopCallback | None = None,
         cwd: Path | None = None,
+        environment: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         process = subprocess.Popen(
             command,
@@ -407,6 +418,7 @@ class ClaudeCliAgent(CodexCliAgent):
             text=True,
             bufsize=1,
             cwd=cwd,
+            env=environment,
         )
         assert process.stdin is not None
         assert process.stdout is not None
