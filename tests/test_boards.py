@@ -3,13 +3,17 @@ from __future__ import annotations
 import unittest
 
 from lightacademia.boards import (
+    board_action_hash_comment,
+    board_action_script,
     board_data_file,
+    board_definition_hash,
     board_fetch_hash,
     board_fetch_hash_comment,
     board_fetch_script,
     build_board_action_prompt,
     build_board_prompt,
     parse_note_boards,
+    script_action_hash,
     script_fetch_hash,
 )
 
@@ -117,6 +121,102 @@ Fetch all recent runs.
 
         self.assertEqual(result.boards[0].fetch_mode, "agent")
         self.assertIn("fetch mode", result.errors[0].message)
+
+    def test_parses_unquoted_fast_action_and_builds_script_contract(self) -> None:
+        board = parse_note_boards(
+            """```board
+name: Experiments
+actions:
+- [fast] Resume: Resume the selected experiment
+- Troubleshoot: Tail the log and summarize it
+columns:
+- Name
+- Cluster
+
+Fetch recent experiments.
+```
+"""
+        ).boards[0]
+
+        self.assertEqual(
+            [(action.name, action.fast) for action in board.actions],
+            [("Resume", True), ("Troubleshoot", False)],
+        )
+        self.assertEqual(
+            board_action_script(board.name, board.actions[0].name),
+            "code/board-experiments-action-resume.py",
+        )
+        marker = board_action_hash_comment(board)
+        self.assertEqual(
+            script_action_hash(f"#!/usr/bin/env python\n{marker}\n"),
+            board_definition_hash(board),
+        )
+        prompt = build_board_action_prompt(
+            board,
+            board.actions[0],
+            {"Name": "run-42", "Cluster": "Fir"},
+            "Experiments.md",
+        )
+        self.assertIn("Fast action script maintenance requirements:", prompt)
+        self.assertIn("code/board-experiments-action-resume.py", prompt)
+        self.assertIn(marker, prompt)
+        self.assertIn("--row-json <json>", prompt)
+        self.assertIn("must perform the requested action", prompt)
+
+    def test_parses_combined_fast_refresh_flags(self) -> None:
+        board = parse_note_boards(
+            """```board
+name: Experiments
+fetch: fast
+actions:
+- [fast,refresh] Resume: Resume the selected experiment
+
+Fetch experiments.
+```
+"""
+        ).boards[0]
+
+        action = board.actions[0]
+        self.assertTrue(action.fast)
+        self.assertTrue(action.refresh)
+        prompt = build_board_action_prompt(
+            board,
+            action,
+            {"Name": "run-42"},
+            "Experiments.md",
+        )
+        self.assertIn("Refresh after action:", prompt)
+        self.assertIn("Fetch experiments.", prompt)
+        self.assertIn("Do not skip the refresh", prompt)
+
+    def test_any_board_change_invalidates_fast_scripts(self) -> None:
+        original = parse_note_boards(
+            """```board
+name: Runs
+actions:
+- [fast] Resume: Resume the selected run
+filters:
+- Cluster: dropdown
+
+Fetch runs.
+```
+"""
+        ).boards[0]
+        changed = parse_note_boards(
+            """```board
+name: Runs
+actions:
+- [fast] Resume: Resume the selected run
+filters:
+- Cluster
+
+Fetch runs.
+```
+"""
+        ).boards[0]
+
+        self.assertNotEqual(board_definition_hash(original), board_definition_hash(changed))
+        self.assertNotEqual(board_fetch_hash(original), board_fetch_hash(changed))
 
     def test_builds_refresh_prompt_with_context(self) -> None:
         board = parse_note_boards(BOARD_MARKDOWN).boards[0]

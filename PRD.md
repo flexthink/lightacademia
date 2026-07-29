@@ -171,12 +171,17 @@ Add the results to this note.
 - `text` and `dropdown` are the supported board filter types
 - Board data is stored at `data/board-{normalized board name}.csv` inside the current project
 - The default fetch mode runs the agent on every refresh with the source note, board name, board data file, and fetch instructions; action definitions are excluded and the prompt explicitly prohibits executing board actions
-- With `fetch: fast`, the agent creates a deterministic script at `code/board-{normalized board name}-fetch.py`, marks it with a hash of the fetch instructions, required columns, and output path, and runs it to populate the CSV
+- With `fetch: fast`, the agent creates a deterministic script at `code/board-{normalized board name}-fetch.py`, marks it with a hash of the complete board definition, and runs it to populate the CSV
 - Later fast refreshes run that script directly while its marked hash matches; missing or stale scripts invoke the agent to create or update the script
 - A successful direct fast refresh is committed by the application; script failures are displayed as warnings and leave the previous board data available
 - When its CSV exists, the board renders it with `st.dataframe`
 - Each board action is displayed as a `ButtonColumn` for every CSV row
-- Clicking a row action immediately runs the agent with a prompt containing the selected row, source note, board name, board data file, action name, and action instructions
+- Prefixing an action name with `[fast]` creates a reusable action script at `code/board-{normalized board name}-action-{normalized action name}.py`; flags can be combined such as `[fast,refresh]`
+- Fast action scripts accept the selected row as JSON plus the source note and board data file as command-line parameters
+- The first run of a missing or stale fast action invokes the agent to create or update all fast scripts and perform the selected action; later matching runs invoke the script directly without an agent
+- An action marked `refresh` refreshes its board after it completes; a matching fast fetch script runs directly, otherwise the application starts the normal board refresh workflow
+- Any change to the board definition invalidates its fast fetch and action scripts so the next agent-assisted board operation can reconcile them
+- Clicking an action without `[fast]` continues to run the agent with the selected row, source note, board name, board data file, action name, and action instructions
 - Refresh and row action runs use the normal progress display and can be stopped
 - Malformed board blocks are reported without preventing the note from loading
 
@@ -187,7 +192,7 @@ Example:
 name: Experiments
 fetch: fast
 actions:
-- Resume: Resume the selected experiment
+- [fast,refresh] Resume: Resume the selected experiment
 - Troubleshoot: Tail the log file and summarize the findings
 filters:
 - Name

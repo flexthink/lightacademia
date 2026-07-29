@@ -15,7 +15,9 @@ Rules:
 - When a CSV should be shown as an interactive table in Light Academia, reference it from Markdown with a project-relative dataframe link such as `[dataframe](data/metrics.csv)`.
 - Keep dataframe CSV files inside the selected project, usually under `data/`; plain Markdown readers will show the dataframe syntax as a normal link.
 - When a board request provides a board data file, write the fetched rows to that exact project-relative CSV path. The board preview reads that file directly.
-- A board refresh only fetches rows. Ignore board `actions` metadata during a refresh and never execute a board action unless the request explicitly identifies a selected row and action.
+- A board refresh only fetches rows. Do not execute a board action unless the request explicitly identifies a selected row and action; fast action metadata may be used during refresh only to maintain reusable scripts.
+- When a board prompt includes fast fetch or fast action script requirements, create deterministic scripts with the exact marked hash and command-line interface provided. Fast action maintenance during a refresh must never execute an action.
+- When a selected board action is marked for refresh, perform the requested action first and then refresh the board data according to the supplied board fetch instructions.
 - To show friendlier dataframe column names, place an optional fenced `dataframe` YAML block immediately after the link:
   ```dataframe
   columns:

@@ -46,11 +46,14 @@ from lightacademia.boards import (
     BoardAction,
     BoardFilter,
     NoteBoard,
+    board_action_script,
+    board_definition_hash,
     board_fetch_hash,
     board_fetch_script,
     build_board_action_prompt,
     build_board_prompt,
     parse_note_boards,
+    script_action_hash,
     script_fetch_hash,
 )
 from lightacademia.chat import append_chat_entry, list_chat_log_dates, read_chat_log
@@ -925,6 +928,7 @@ def init_state() -> None:
         "requested_action": None,
         "queued_agent_prompt": None,
         "board_action_needs_app_rerun": False,
+        "pending_fast_board_action": None,
         "agent_chat_revision": 0,
         "source_visible": False,
         "editor_cursors": {},
@@ -2019,6 +2023,24 @@ def current_fast_fetch_script(board: NoteBoard, project_dir: Path) -> Path | Non
     return script_path if script_hash == board_fetch_hash(board) else None
 
 
+def current_fast_action_script(
+    board: NoteBoard,
+    action: BoardAction,
+    project_dir: Path,
+) -> Path | None:
+    if not action.fast:
+        return None
+    project_root = project_dir.resolve()
+    script_path = (project_root / board_action_script(board.name, action.name)).resolve()
+    if not script_path.is_relative_to(project_root) or not script_path.is_file():
+        return None
+    try:
+        script_hash = script_action_hash(script_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+    return script_path if script_hash == board_definition_hash(board) else None
+
+
 def run_fast_board_fetch(board: NoteBoard, project_dir: Path, script_path: Path) -> None:
     config = get_config()
     relative_script = script_path.relative_to(project_dir.resolve())
@@ -2063,6 +2085,117 @@ def run_fast_board_fetch(board: NoteBoard, project_dir: Path, script_path: Path)
     st.session_state.last_agent_error = None
 
 
+def run_fast_board_action(
+    board: NoteBoard,
+    action: BoardAction,
+    row: dict[str, object],
+    project_dir: Path,
+    note_name: str,
+    script_path: Path,
+) -> bool:
+    config = get_config()
+    project_root = project_dir.resolve()
+    relative_script = script_path.resolve().relative_to(project_root)
+    environment = os.environ.copy()
+    environment["LIGHTACADEMIA_TOOLS"] = str(config.tools_dir.resolve())
+    row_json = json.dumps(row, ensure_ascii=False, default=str)
+    with st.spinner(f"Running: {action.name}"):
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(relative_script),
+                    "--row-json",
+                    row_json,
+                    "--source-note",
+                    note_name,
+                    "--board-data-file",
+                    board.data_file,
+                ],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                timeout=config.agent_timeout_seconds,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            st.session_state.last_agent_error = f"Fast action `{action.name}` failed: {exc}"
+            return False
+
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "No output.").strip()
+        st.session_state.last_agent_error = (
+            f"Fast action `{action.name}` failed with exit code {result.returncode}:\n\n"
+            f"```\n{details[-4000:]}\n```"
+        )
+        return False
+
+    st.session_state.last_agent_error = None
+    output = result.stdout.strip()
+    st.toast(output.splitlines()[-1] if output else f"{action.name} completed.")
+    return True
+
+
+def refresh_board_after_action(
+    board: NoteBoard,
+    action: BoardAction,
+    project_dir: Path,
+    note_name: str,
+) -> None:
+    fast_script = (
+        current_fast_fetch_script(board, project_dir)
+        if board.fetch_mode == "fast"
+        else None
+    )
+    if fast_script is not None:
+        run_fast_board_fetch(board, project_dir, fast_script)
+        return
+    start_board_agent_command(
+        build_board_prompt(board, note_name),
+        project_dir,
+        note_name,
+        operation=f"board refresh after {action.name}",
+    )
+
+
+def run_pending_fast_board_action(
+    board: NoteBoard,
+    project_dir: Path,
+    note_name: str,
+) -> None:
+    pending = st.session_state.get("pending_fast_board_action")
+    if not isinstance(pending, dict):
+        return
+    if (
+        pending.get("project_dir") != str(project_dir.resolve())
+        or pending.get("note_name") != note_name
+        or pending.get("board_name") != board.name
+    ):
+        return
+    st.session_state.pending_fast_board_action = None
+    action = pending.get("action")
+    row = pending.get("row")
+    script_path = pending.get("script_path")
+    if (
+        not isinstance(action, BoardAction)
+        or not isinstance(row, dict)
+        or not isinstance(script_path, str)
+    ):
+        st.session_state.last_agent_error = "Could not run fast action: invalid queued action."
+        return
+    completed = run_fast_board_action(
+        board,
+        action,
+        row,
+        project_dir,
+        note_name,
+        Path(script_path),
+    )
+    if completed and action.refresh:
+        refresh_board_after_action(board, action, project_dir, note_name)
+
+
 def handle_board_action_click(
     click_key: str,
     board: NoteBoard,
@@ -2077,10 +2210,23 @@ def handle_board_action_click(
     row_index = int(click["row"])
     if row_index < 0 or row_index >= len(dataframe.index):
         return
+    row = board_row_values(dataframe, row_index)
+    fast_script = current_fast_action_script(board, action, project_dir)
+    if fast_script is not None:
+        st.session_state.pending_fast_board_action = {
+            "project_dir": str(project_dir.resolve()),
+            "note_name": note_name,
+            "board_name": board.name,
+            "action": action,
+            "row": row,
+            "script_path": str(fast_script),
+        }
+        st.session_state.board_action_needs_app_rerun = True
+        return
     prompt = build_board_action_prompt(
         board,
         action,
-        board_row_values(dataframe, row_index),
+        row,
         note_name,
     )
     start_board_agent_command(
@@ -2106,6 +2252,7 @@ def render_note_board(
         f"{source_key}:board:{start_line}:{board.name}".encode("utf-8")
     ).hexdigest()[:16]
     st.markdown(f"#### {board.name}")
+    run_pending_fast_board_action(board, project_dir, note_name)
     controls_enabled = interactive and not bool(st.session_state.get("agent_running"))
     if controls_enabled and st.button(
         f"**Refresh:** {board.name}",
@@ -2153,7 +2300,9 @@ def render_note_board(
         for action_index, action in enumerate(board.actions):
             column_name = f"__board_action_{action_index}"
             click_key = f"board_action_click_{board_key}_{action_index}"
-            display_dataframe[column_name] = [":material/bolt: Run"] * len(display_dataframe.index)
+            display_dataframe[column_name] = [
+                f":material/bolt: {action.name}"
+            ] * len(display_dataframe.index)
             column_order.append(column_name)
             column_config[column_name] = st.column_config.ButtonColumn(
                 action.name,

@@ -80,8 +80,9 @@ its rows and may expose actions for each row:
 ````markdown
 ```board
 name: Experiments
+fetch: fast
 actions:
-- Resume: Resume the selected experiment
+- [fast,refresh] Resume: Resume the selected experiment
 - Troubleshoot: Tail the log file and summarize the findings
 filters:
 - Name
@@ -97,11 +98,26 @@ Fetch experiments from the cluster that have run within the last week.
 ```
 ````
 
-Refreshing this example immediately runs the Robot to write
-`data/board-experiments.csv`. When the file exists, the preview displays it as
-an interactive dataframe. Refreshing never executes the board's row actions.
-Each declared action becomes a button column. Refreshes and row actions run with
-the normal stoppable progress display.
+With `fetch: fast`, the first refresh asks the Robot to create
+`code/board-experiments-fetch.py` and write `data/board-experiments.csv`.
+Later refreshes run that script directly. Changing any part of the board
+invalidates its reusable scripts, and Light Academia asks the Robot to reconcile
+them before using them again. Omit `fetch: fast` to run the Robot on every
+refresh.
+
+When the CSV exists, the preview displays it as an interactive dataframe.
+Refreshing never executes the board's row actions. Each declared action becomes
+a button column. Robot refreshes and row actions use the normal stoppable
+progress display.
+
+Prefix an action with `[fast]` to have the Robot create a reusable script such
+as `code/board-experiments-action-resume.py`. Its first run creates the script
+and performs the action. Later runs pass the selected row to that script and do
+not invoke the Robot. Actions without `[fast]` retain the normal Robot workflow.
+
+Add `refresh` to an action's flags, for example `[fast,refresh]`, to refresh the
+board after a successful action. A current fast fetch script runs directly; all
+other boards use the normal Robot refresh flow.
 
 Board filters are local and do not call the Robot. A bare column name creates a
 case-insensitive text filter. Add `: dropdown` to select from the distinct values
@@ -147,6 +163,8 @@ The default implementation uses the Codex CLI:
 - Displays Codex events directly without a separate summarization model call
 - Uses the selected project as the working root
 - Adds a temporary copy of the configured tools folder as an auxiliary workspace
+- Sets `LIGHTACADEMIA_TOOLS` to the available tools root. Project scripts should
+  resolve this variable at runtime rather than embedding the temporary path.
 - Uses `workspace-write` sandboxing
 - Enables outbound network access for commands inside the Codex workspace-write sandbox
 - Tells Codex to write derived outputs under `data/` and scratch scripts under `code/`

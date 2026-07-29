@@ -14,6 +14,8 @@ from markdown_it import MarkdownIt
 class BoardAction:
     name: str
     instructions: str
+    fast: bool = False
+    refresh: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ class BoardParseResult:
 
 _MARKDOWN = MarkdownIt("commonmark")
 FETCH_HASH_MARKER = "lightacademia-board-fetch-sha256"
+ACTION_HASH_MARKER = "lightacademia-board-action-sha256"
 
 
 def normalize_board_name(name: str) -> str:
@@ -64,18 +67,48 @@ def board_fetch_script(name: str) -> str:
     return f"code/board-{normalize_board_name(name)}-fetch.py"
 
 
-def board_fetch_hash(board: NoteBoard) -> str:
-    fetch_spec = {
+def board_action_script(board_name: str, action_name: str) -> str:
+    return (
+        f"code/board-{normalize_board_name(board_name)}"
+        f"-action-{normalize_board_name(action_name)}.py"
+    )
+
+
+def board_definition_hash(board: NoteBoard) -> str:
+    board_spec = {
+        "name": board.name,
         "instructions": board.instructions,
+        "actions": [
+            {
+                "name": action.name,
+                "instructions": action.instructions,
+                "fast": action.fast,
+                "refresh": action.refresh,
+            }
+            for action in board.actions
+        ],
+        "filters": [
+            {"column": board_filter.column, "type": board_filter.filter_type}
+            for board_filter in board.filters
+        ],
         "columns": list(board.columns),
+        "fetch_mode": board.fetch_mode,
         "data_file": board.data_file,
     }
-    encoded = json.dumps(fetch_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    encoded = json.dumps(board_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def board_fetch_hash(board: NoteBoard) -> str:
+    return board_definition_hash(board)
 
 
 def board_fetch_hash_comment(board: NoteBoard) -> str:
     return f"# {FETCH_HASH_MARKER}: {board_fetch_hash(board)}"
+
+
+def board_action_hash_comment(board: NoteBoard) -> str:
+    return f"# {ACTION_HASH_MARKER}: {board_definition_hash(board)}"
 
 
 def script_fetch_hash(script: str) -> str | None:
@@ -84,6 +117,22 @@ def script_fetch_hash(script: str) -> str | None:
         script,
     )
     return match.group(1).lower() if match else None
+
+
+def script_action_hash(script: str) -> str | None:
+    match = re.search(
+        rf"(?m)^\s*#\s*{re.escape(ACTION_HASH_MARKER)}:\s*([0-9a-fA-F]{{64}})\s*$",
+        script,
+    )
+    return match.group(1).lower() if match else None
+
+
+def normalize_action_flags_yaml(source: str) -> str:
+    return re.sub(
+        r"(?im)^(\s*-\s*)(\[[A-Za-z][A-Za-z\s,]*\]\s+[^:\n]+)(\s*:)",
+        lambda match: f"{match.group(1)}{json.dumps(match.group(2))}{match.group(3)}",
+        source,
+    )
 
 
 def parse_note_boards(markdown: str) -> BoardParseResult:
@@ -110,7 +159,8 @@ def parse_note_boards(markdown: str) -> BoardParseResult:
             continue
 
         try:
-            metadata = yaml.safe_load("\n".join(lines[first_content:separator]))
+            metadata_source = "\n".join(lines[first_content:separator])
+            metadata = yaml.safe_load(normalize_action_flags_yaml(metadata_source))
         except yaml.YAMLError as exc:
             errors.append(BoardParseError(block_line, f"Could not parse board metadata: {exc}"))
             continue
@@ -152,10 +202,27 @@ def parse_note_boards(markdown: str) -> BoardParseResult:
             action_name, action_instructions = next(iter(raw_action.items()))
             cleaned_name = str(action_name).strip()
             cleaned_instructions = str(action_instructions or "").strip()
+            fast = False
+            refresh = False
+            flags_match = re.match(r"^\[([^\]]+)\]\s+", cleaned_name)
+            if flags_match:
+                flags = {flag.strip().casefold() for flag in flags_match.group(1).split(",")}
+                unsupported_flags = flags - {"fast", "refresh"}
+                if unsupported_flags:
+                    errors.append(
+                        BoardParseError(
+                            block_line,
+                            "Unsupported board action flag(s): "
+                            f"{', '.join(sorted(unsupported_flags))}. Use `fast` and/or `refresh`.",
+                        )
+                    )
+                fast = "fast" in flags
+                refresh = "refresh" in flags
+                cleaned_name = cleaned_name[flags_match.end() :].strip()
             if not cleaned_name or not cleaned_instructions:
                 errors.append(BoardParseError(block_line, "Board action names and instructions cannot be empty."))
                 continue
-            parsed_actions.append(BoardAction(cleaned_name, cleaned_instructions))
+            parsed_actions.append(BoardAction(cleaned_name, cleaned_instructions, fast, refresh))
 
         parsed_filters: list[BoardFilter] = []
         raw_filters = metadata.get("filters", [])
@@ -238,6 +305,34 @@ def parse_note_boards(markdown: str) -> BoardParseResult:
     return BoardParseResult(tuple(boards), tuple(errors))
 
 
+def fast_action_maintenance_requirements(board: NoteBoard) -> str:
+    fast_actions = [action for action in board.actions if action.fast]
+    if not fast_actions:
+        return ""
+    scripts = "\n".join(
+        (
+            f"- `{board_action_script(board.name, action.name)}` for `{action.name}`: "
+            f"{action.instructions}"
+        )
+        for action in fast_actions
+    )
+    return (
+        "Fast action script maintenance requirements:\n"
+        "- Check every fast action script listed below. Create it if missing, or update it "
+        "if its marked board hash does not match.\n"
+        f"{scripts}\n"
+        "- Include this exact marked comment in every fast action script:\n"
+        f"  `{board_action_hash_comment(board)}`\n"
+        "- Each script must run non-interactively with Python from the project root and accept:\n"
+        "  `--row-json <json> --source-note <name> --board-data-file <path>`\n"
+        "- Parse `--row-json` as a JSON object and use the relevant board column values as "
+        "action parameters.\n"
+        "- Reuse the project's SKILL.md and researcher tools where appropriate.\n"
+        "- Locate researcher tools through the `LIGHTACADEMIA_TOOLS` environment variable "
+        "at runtime. Never hardcode the current tools directory into a script.\n"
+    )
+
+
 def build_board_prompt(board: NoteBoard, note_name: str) -> str:
     column_requirements = ""
     if board.columns:
@@ -260,6 +355,12 @@ def build_board_prompt(board: NoteBoard, note_name: str) -> str:
             "at runtime. Never hardcode the current tools directory into the script.\n"
             "- Run the script now to populate the CSV, and fix the script if that run fails.\n\n"
         )
+    fast_action_requirements = fast_action_maintenance_requirements(board)
+    if fast_action_requirements:
+        fast_action_requirements += (
+            "- This refresh may create or update fast action scripts, but it must not execute "
+            "any board action.\n\n"
+        )
     return (
         "Selected note board refresh:\n"
         f"Source note: {note_name}\n"
@@ -269,11 +370,13 @@ def build_board_prompt(board: NoteBoard, note_name: str) -> str:
         f"{board.instructions}\n\n"
         "Board action constraint:\n"
         "- This is a data refresh, not a board action.\n"
-        "- Ignore the board's actions metadata, even if you read it from the source note.\n"
+        "- Do not perform board actions. Fast action definitions may be used only to create "
+        "or update their reusable scripts.\n"
         "- Do not execute, simulate, or apply any board action to any row. Board actions are "
         "separate commands that run only when the user presses a row action button.\n\n"
         f"{column_requirements}"
         f"{fast_fetch_requirements}"
+        f"{fast_action_requirements}"
         "Output requirements:\n"
         f"- Fetch the board data using the instructions above.\n"
         f"- Write or replace the board CSV at `{board.data_file}` inside the selected project.\n"
@@ -290,6 +393,29 @@ def build_board_action_prompt(
     note_name: str,
 ) -> str:
     row_json = json.dumps(dict(row), ensure_ascii=False, indent=2, default=str)
+    maintenance_requirements = fast_action_maintenance_requirements(board)
+    if maintenance_requirements:
+        if action.fast:
+            maintenance_requirements += (
+                f"- After the scripts are ready, run `{board_action_script(board.name, action.name)}` "
+                "for the selected row using the interface above. This first Robot-assisted run "
+                "must perform the requested action as well as preparing the reusable script.\n\n"
+            )
+        else:
+            maintenance_requirements += (
+                "- Do not execute any fast action script during this command; the selected action "
+                "below is not marked fast.\n\n"
+            )
+    refresh_requirements = ""
+    if action.refresh:
+        refresh_requirements = (
+            "Refresh after action:\n"
+            f"- After the action succeeds, refresh `{board.data_file}` using these board fetch instructions:\n"
+            f"{board.instructions}\n"
+            "- If this board uses fast fetch, create or update its marked fetch script when needed, "
+            "then run it. Otherwise fetch the CSV directly.\n"
+            "- Do not skip the refresh merely because the action itself completed successfully.\n\n"
+        )
     return (
         "Selected board row action:\n"
         f"Source note: {note_name}\n"
@@ -298,6 +424,8 @@ def build_board_action_prompt(
         f"Action name: {action.name}\n\n"
         "Selected row:\n"
         f"```json\n{row_json}\n```\n\n"
+        f"{maintenance_requirements}"
+        f"{refresh_requirements}"
         "Action instructions:\n"
         f"{action.instructions}"
     )
