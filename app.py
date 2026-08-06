@@ -2001,6 +2001,13 @@ def render_board_filters(
                         },
                         key=str.casefold,
                     )
+                    previous_selection = st.session_state.get(widget_key)
+                    if (
+                        isinstance(previous_selection, str)
+                        and previous_selection
+                        and previous_selection not in options
+                    ):
+                        options.insert(0, previous_selection)
                     selected = st.selectbox(
                         board_filter.column,
                         [None, *options],
@@ -2306,7 +2313,7 @@ def render_note_board(
     interactive: bool,
 ) -> None:
     board_key = hashlib.sha256(
-        f"{source_key}:board:{start_line}:{board.name}".encode("utf-8")
+        f"{project_dir.resolve()}:{note_name}:board:{start_line}:{board.name}".encode("utf-8")
     ).hexdigest()[:16]
     st.markdown(f"#### {board.name}")
     run_pending_fast_board_action(board, project_dir, note_name)

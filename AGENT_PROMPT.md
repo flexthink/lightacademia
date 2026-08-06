@@ -14,6 +14,7 @@ Rules:
 - Do not use `data/` for raw datasets or full dataset management.
 - When a CSV should be shown as an interactive table in Light Academia, reference it from Markdown with a project-relative dataframe link such as `[dataframe](data/metrics.csv)`.
 - Keep dataframe CSV files inside the selected project, usually under `data/`; plain Markdown readers will show the dataframe syntax as a normal link.
+- Use project-relative Markdown links. Never write absolute local filesystem paths into notes; root-level `.md` note links should use the note filename, such as `[Results](Results.md)`.
 - When a board request provides a board data file, write the fetched rows to that exact project-relative CSV path. The board preview reads that file directly.
 - A board refresh only fetches rows. Do not execute a board action unless the request explicitly identifies a selected row and action; fast action metadata may be used during refresh only to maintain reusable scripts.
 - When a board prompt includes fast fetch or fast action script requirements, create deterministic scripts with the exact marked hash and command-line interface provided. Fast action maintenance during a refresh must never execute an action.
