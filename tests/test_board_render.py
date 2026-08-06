@@ -16,6 +16,41 @@ from lightacademia.boards import (
 
 
 class BoardRenderTest(unittest.TestCase):
+    def test_renders_fast_action_completion_with_hidden_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+            script = f'''\
+from types import SimpleNamespace
+import streamlit as st
+from pathlib import Path
+
+from app import render_fast_action_completion
+from lightacademia.storage import Project
+
+st.session_state.last_fast_action_result = {{
+    "action_name": "Resume",
+    "board_name": "Experiments",
+    "project_dir": {str(project_dir.resolve())!r},
+    "note_name": "Experiments.md",
+    "command": "python code/board-experiments-action-resume.py",
+    "output": "resumed run-42",
+    "error_output": "",
+}}
+render_fast_action_completion(
+    Project("Research", Path({str(project_dir)!r})),
+    SimpleNamespace(name="Experiments.md"),
+)
+'''
+
+            app_test = AppTest.from_string(script).run()
+
+            self.assertEqual(list(app_test.exception), [])
+            self.assertEqual(len(app_test.success), 1)
+            self.assertIn("Resume", app_test.success[0].value)
+            self.assertIn("Experiments", app_test.success[0].value)
+            self.assertEqual(len(app_test.expander), 1)
+            self.assertEqual(app_test.expander[0].label, "Command details")
+
     def test_current_fast_action_runs_without_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)

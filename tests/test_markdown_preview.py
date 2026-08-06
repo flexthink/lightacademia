@@ -4,8 +4,11 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from streamlit.testing.v1 import AppTest
+
 from lightacademia.markdown_preview import (
     ProjectDataframeError,
+    find_standalone_project_file_links,
     ProjectImageError,
     find_markdown_tables,
     find_standalone_dataframes,
@@ -14,6 +17,7 @@ from lightacademia.markdown_preview import (
     format_markdown_table_for_plain_text,
     resolve_project_dataframe,
     resolve_project_image,
+    relativize_project_links,
     rewrite_project_note_links,
 )
 
@@ -194,6 +198,91 @@ class RewriteProjectNoteLinksTest(unittest.TestCase):
 
         self.assertEqual(markdown, "See [Missing](Missing.md).\n")
         self.assertEqual(errors, ("Note not found: `Missing.md`.",))
+
+    def test_rewrites_absolute_project_note_links_to_hash_routes(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            (project_root / "Home.md").write_text("# Home\n", encoding="utf-8")
+            (project_root / "Results.md").write_text("# Results\n", encoding="utf-8")
+
+            markdown, errors = rewrite_project_note_links(
+                f"[Results]({project_root / 'Results.md'})\n",
+                project_root,
+            )
+
+            self.assertEqual(errors, ())
+            self.assertIn("[Results](#/project/", markdown)
+            self.assertIn("/note/Results.md)", markdown)
+
+
+class ProjectFileLinksTest(unittest.TestCase):
+    def test_relativizes_absolute_project_file_links(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            data_file = project_root / "data" / "run.log"
+            data_file.parent.mkdir()
+            data_file.write_text("finished\n", encoding="utf-8")
+
+            markdown = relativize_project_links(
+                f"[Training log]({data_file})\n",
+                project_root,
+            )
+
+            self.assertEqual(markdown, "[Training log](data/run.log)\n")
+
+    def test_finds_standalone_project_file_links_for_download_cards(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            report = project_root / "data" / "report.pdf"
+            report.parent.mkdir()
+            report.write_bytes(b"pdf")
+
+            links = find_standalone_project_file_links(
+                "[Final report](data/report.pdf)\n\nInline [report](data/report.pdf).\n",
+                project_root,
+            )
+
+            self.assertEqual(len(links), 1)
+            self.assertEqual(links[0].target, "data/report.pdf")
+            self.assertEqual(links[0].title, "Final report")
+
+    def test_treats_nested_markdown_files_as_downloads_not_pages(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            document = project_root / "data" / "details.md"
+            document.parent.mkdir()
+            document.write_text("details\n", encoding="utf-8")
+
+            links = find_standalone_project_file_links(
+                "[Details](data/details.md)\n",
+                project_root,
+            )
+
+            self.assertEqual(len(links), 1)
+            self.assertEqual(links[0].title, "Details")
+
+    def test_renders_standalone_file_link_as_download_card(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            report = project_root / "data" / "report.txt"
+            report.parent.mkdir()
+            report.write_text("results\n", encoding="utf-8")
+            script = f'''\
+from pathlib import Path
+from app import render_project_markdown
+
+render_project_markdown(
+    "[Final report]({report})\\n",
+    Path({str(project_root)!r}),
+    "test",
+)
+'''
+
+            app_test = AppTest.from_string(script).run()
+
+            self.assertEqual(list(app_test.exception), [])
+            self.assertEqual(len(app_test.download_button), 1)
+            self.assertEqual(app_test.download_button[0].label, "Download")
 
 
 if __name__ == "__main__":

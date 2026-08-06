@@ -13,6 +13,7 @@ import mimetypes
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -72,12 +73,16 @@ from lightacademia.git_ops import (
 )
 from lightacademia.markdown_preview import (
     ProjectDataframeError,
+    ProjectFileLinkError,
     ProjectImageError,
+    find_standalone_project_file_links,
     find_markdown_tables,
     find_standalone_dataframes,
     find_standalone_images,
     resolve_project_dataframe,
+    resolve_project_link_path,
     resolve_project_image,
+    relativize_project_links,
     rewrite_project_note_links,
 )
 from lightacademia.routing import WorkspaceRoute
@@ -885,7 +890,7 @@ def delete_tool_file_dialog(tools_dir: Path, path: Path) -> None:
             st.error(f"Could not delete file: {exc}")
 
 
-@st.dialog("Agent chat history", icon=":material/forum:")
+@st.dialog("Robot chat history", icon=":material/forum:")
 def chat_history_dialog(project: Project) -> None:
     available_dates = list_chat_log_dates(project.path)
     default_date = available_dates[0] if available_dates else date.today()
@@ -900,7 +905,7 @@ def chat_history_dialog(project: Project) -> None:
 
     content = read_chat_log(project.path, selected_date)
     if not content.strip():
-        st.info(f"No agent chats recorded for {selected_date:%Y-%m-%d}.")
+        st.info(f"No robot chats recorded for {selected_date:%Y-%m-%d}.")
         return
 
     with st.container(height=560, border=True):
@@ -921,6 +926,8 @@ def init_state() -> None:
         "preview_source_note_name": None,
         "last_agent_response": None,
         "last_agent_error": None,
+        "last_fast_action_result": None,
+        "pending_fast_action_agent_notice": None,
         "agent_running": False,
         "active_agent_run_id": None,
         "agent_progress_entries": [],
@@ -1803,7 +1810,11 @@ def render_project_markdown(
     )
     events.extend(
         (dataframe.start_line, dataframe.end_line, "dataframe", dataframe)
-        for dataframe in find_standalone_dataframes(markdown)
+        for dataframe in find_standalone_dataframes(rendered_markdown)
+    )
+    events.extend(
+        (file_link.start_line, file_link.end_line, "file", file_link)
+        for file_link in find_standalone_project_file_links(rendered_markdown, project_dir)
     )
     events.extend(
         (table.start_line, table.end_line, "table", table)
@@ -1863,6 +1874,12 @@ def render_project_markdown(
                     columns=event.columns,
                     annotation_error=event.annotation_error,
                 )
+        elif event_type == "file":
+            try:
+                file_path = resolve_project_link_path(project_dir, event.target)
+                render_project_file_link(file_path, event.title, source_key, start_line)
+            except (ProjectFileLinkError, OSError) as exc:
+                st.warning(f"Could not open local file link: {exc}")
         else:
             table_markdown = "".join(lines[start_line:end_line])
             render_copyable_table(table_markdown, event.copy_text, event.latex_text, source_key, start_line)
@@ -1885,6 +1902,28 @@ def render_copyable_table(table_markdown: str, copy_text: str, latex_text: str, 
         height=42,
     )
     st.markdown(table_markdown)
+
+
+def render_project_file_link(file_path: Path, title: str, source_key: str, start_line: int) -> None:
+    try:
+        content = file_path.read_bytes()
+    except OSError as exc:
+        st.warning(f"Could not read `{file_path.name}`: {exc}")
+        return
+    mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    link_key = hashlib.sha256(
+        f"{source_key}:file:{start_line}:{file_path}".encode("utf-8")
+    ).hexdigest()[:16]
+    with st.container(border=True):
+        st.markdown(f"**{html.escape(title)}**")
+        st.download_button(
+            "Download",
+            data=content,
+            file_name=file_path.name,
+            mime=mime_type,
+            key=f"download_project_file_{link_key}",
+            icon=":material/download:",
+        )
 
 
 def render_project_dataframe(
@@ -2101,17 +2140,18 @@ def run_fast_board_action(
     row_json = json.dumps(row, ensure_ascii=False, default=str)
     with st.spinner(f"Running: {action.name}"):
         try:
+            command = [
+                sys.executable,
+                str(relative_script),
+                "--row-json",
+                row_json,
+                "--source-note",
+                note_name,
+                "--board-data-file",
+                board.data_file,
+            ]
             result = subprocess.run(
-                [
-                    sys.executable,
-                    str(relative_script),
-                    "--row-json",
-                    row_json,
-                    "--source-note",
-                    note_name,
-                    "--board-data-file",
-                    board.data_file,
-                ],
+                command,
                 cwd=project_root,
                 capture_output=True,
                 text=True,
@@ -2132,8 +2172,15 @@ def run_fast_board_action(
         return False
 
     st.session_state.last_agent_error = None
-    output = result.stdout.strip()
-    st.toast(output.splitlines()[-1] if output else f"{action.name} completed.")
+    st.session_state.last_fast_action_result = {
+        "action_name": action.name,
+        "board_name": board.name,
+        "project_dir": str(project_root),
+        "note_name": note_name,
+        "command": shlex.join(command),
+        "output": result.stdout.strip(),
+        "error_output": result.stderr.strip(),
+    }
     return True
 
 
@@ -2229,12 +2276,22 @@ def handle_board_action_click(
         row,
         note_name,
     )
-    start_board_agent_command(
+    started = start_board_agent_command(
         prompt,
         project_dir,
         note_name,
         operation="board action",
     )
+    if action.fast and started:
+        run_id = st.session_state.get("active_agent_run_id")
+        if isinstance(run_id, str):
+            st.session_state.pending_fast_action_agent_notice = {
+                "run_id": run_id,
+                "action_name": action.name,
+                "board_name": board.name,
+                "project_dir": str(project_dir.resolve()),
+                "note_name": note_name,
+            }
     # ButtonColumn invokes this as a widget callback, where st.rerun() is a
     # no-op. The fragment run immediately following the callback performs it.
     st.session_state.board_action_needs_app_rerun = True
@@ -2432,6 +2489,7 @@ def start_agent_command(
     agent_runs()[run_id] = run_state
     st.session_state.active_agent_run_id = run_id
     st.session_state.agent_running = True
+    st.session_state.last_agent_response = None
     st.session_state.agent_progress_entries = []
     st.session_state.agent_progress_chars = 0
     logger.info("Starting agent run %s for project=%s note=%s", run_id, project.name, run_state.note_name)
@@ -2488,6 +2546,7 @@ def _agent_worker(run_state: AgentRunState) -> None:
             on_progress=lambda progress: record_agent_progress(run_state, progress),
             should_stop=run_state.stop_requested.is_set,
         )
+        normalize_project_markdown_links(run_state.project)
         after_status = git_status_lines(run_state.project.path)
         changed_lines = [line for line in after_status if line not in run_state.before_status] or after_status
         log_path = append_chat_entry(
@@ -2507,6 +2566,17 @@ def _agent_worker(run_state: AgentRunState) -> None:
         logger.info("Agent run %s failed: %s", run_state.run_id, exc)
     finally:
         run_state.done = True
+
+
+def normalize_project_markdown_links(project: Project) -> None:
+    for note in list_notes(project):
+        try:
+            markdown = read_note(note)
+            normalized = relativize_project_links(markdown, project.path)
+        except OSError:
+            continue
+        if normalized != markdown:
+            save_note(note, normalized)
 
 
 def record_agent_progress(run_state: AgentRunState, progress: AgentProgress) -> None:
@@ -2553,10 +2623,71 @@ def finish_agent_run(run_state: AgentRunState) -> None:
         st.session_state.last_agent_error = None
         st.session_state.last_commit_at = time.time()
     elif isinstance(run_state.error, AgentStopped):
-        st.session_state.last_agent_error = "Agent stopped."
+        st.session_state.last_agent_error = "Robot stopped."
     else:
-        st.session_state.last_agent_error = f"Could not run agent: {run_state.error}"
+        st.session_state.last_agent_error = f"Could not run robot: {run_state.error}"
+    pending_notice = st.session_state.get("pending_fast_action_agent_notice")
+    if isinstance(pending_notice, dict) and pending_notice.get("run_id") == run_state.run_id:
+        st.session_state.pending_fast_action_agent_notice = None
+        if run_state.error is None:
+            st.session_state.last_fast_action_result = {
+                **pending_notice,
+                "command": "",
+                "output": run_state.result.response if run_state.result is not None else "",
+                "error_output": "",
+            }
     reload_note_from_disk()
+
+
+def render_fast_action_completion(project: Project, note) -> None:
+    result = st.session_state.get("last_fast_action_result")
+    if not isinstance(result, dict):
+        return
+    if (
+        result.get("project_dir") != str(project.path.resolve())
+        or result.get("note_name") != note.name
+    ):
+        return
+    action_name = result.get("action_name")
+    board_name = result.get("board_name")
+    if not isinstance(action_name, str) or not isinstance(board_name, str):
+        return
+    st.success(
+        f"**{action_name}** completed on **{board_name}**.",
+        icon=":material/check_circle:",
+    )
+    command = result.get("command")
+    output = result.get("output")
+    error_output = result.get("error_output")
+    if not any(isinstance(value, str) and value for value in (command, output, error_output)):
+        return
+    with st.expander("Command details", expanded=False):
+        if isinstance(command, str) and command:
+            st.code(command, language="bash")
+        if isinstance(output, str) and output:
+            st.code(output)
+        if isinstance(error_output, str) and error_output:
+            st.code(error_output)
+
+
+def render_agent_completion() -> None:
+    response = st.session_state.get("last_agent_response")
+    if not isinstance(response, str) or not response:
+        return
+    summary_col, dismiss_col = st.columns([0.94, 0.06], vertical_alignment="center")
+    with summary_col:
+        st.success("Robot run completed.", icon=":material/check_circle:")
+    with dismiss_col:
+        if st.button(
+            ICON_BUTTON_LABEL,
+            key="dismiss_agent_summary",
+            help="Dismiss robot summary",
+            icon=":material/close:",
+        ):
+            st.session_state.last_agent_response = None
+            st.rerun()
+    with st.expander("Robot details", expanded=False):
+        st.markdown(response)
 
 
 def render_agent_panel(project: Project, note, actions: tuple[NoteAction, ...], tools_dir: Path) -> None:
@@ -2564,7 +2695,7 @@ def render_agent_panel(project: Project, note, actions: tuple[NoteAction, ...], 
     agent_chat_revision = st.session_state.get("agent_chat_revision", 0)
     with st.container(key="agent_panel"):
         with st.expander(
-            "Agent chat",
+            "Robot chat",
             expanded=True,
             key=f"agent_chat_expanded_{agent_chat_revision}",
             on_change="rerun",
@@ -2622,7 +2753,7 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
     with prompt_input:
         prompt = st.text_area("Message", height=120, key=prompt_key, label_visibility="collapsed")
     submitted = st.button(
-        "Run agent",
+        "Run robot",
         key=f"run_agent_{note.name}_{st.session_state.editor_revision}",
     )
     if submitted and (prompt.strip() or selected_action is not None):
@@ -2643,7 +2774,7 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
             )
             st.session_state.last_agent_error = None
         except (OSError, GitError, AgentError) as exc:
-            st.session_state.last_agent_error = f"Could not start agent: {exc}"
+            st.session_state.last_agent_error = f"Could not start robot: {exc}"
         st.rerun()
 
 
@@ -2911,7 +3042,7 @@ def main() -> None:
             if st.button(
                 ICON_BUTTON_LABEL,
                 key="open_chat_history",
-                help="Agent chat history",
+                help="Robot chat history",
                 icon=":material/forum:",
             ):
                 chat_history_dialog(project)
@@ -3005,20 +3136,20 @@ def main() -> None:
         st.info(st.session_state.last_sync_message)
 
     if st.session_state.last_agent_error:
-        st.error(st.session_state.last_agent_error)
-    if st.session_state.last_agent_response:
-        summary_col, dismiss_col = st.columns([0.94, 0.06], vertical_alignment="top")
-        with summary_col:
-            st.markdown(st.session_state.last_agent_response)
+        error_col, dismiss_col = st.columns([0.94, 0.06], vertical_alignment="top")
+        with error_col:
+            st.error(st.session_state.last_agent_error)
         with dismiss_col:
             if st.button(
                 ICON_BUTTON_LABEL,
-                key="dismiss_agent_summary",
-                help="Dismiss agent summary",
+                key="dismiss_agent_error",
+                help="Dismiss robot error",
                 icon=":material/close:",
             ):
-                st.session_state.last_agent_response = None
+                st.session_state.last_agent_error = None
                 st.rerun()
+    render_fast_action_completion(project, note)
+    render_agent_completion()
 
     if not is_history_view:
         render_agent_panel(project, note, action_result.actions, tools_dir)

@@ -27,6 +27,10 @@ class ProjectDataframeError(ValueError):
     pass
 
 
+class ProjectFileLinkError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class MarkdownImage:
     start_line: int
@@ -59,6 +63,14 @@ class MarkdownDataframe:
     annotation_error: str | None = None
 
 
+@dataclass(frozen=True)
+class MarkdownFileLink:
+    start_line: int
+    end_line: int
+    target: str
+    title: str
+
+
 _MARKDOWN = MarkdownIt("commonmark")
 
 
@@ -87,41 +99,81 @@ def is_local_note_target(target: str) -> bool:
     parsed = urlsplit(target)
     return (
         bool(parsed.path)
-        and not parsed.scheme
+        and parsed.scheme in {"", "file"}
         and not parsed.netloc
         and Path(unquote(parsed.path)).suffix.lower() == ".md"
     )
 
 
-def resolve_project_note(project_dir: Path, target: str) -> str:
+def resolve_project_link_path(project_dir: Path, target: str) -> Path:
     parsed = urlsplit(target)
-    relative_path = Path(unquote(parsed.path).removeprefix("./"))
-    if parsed.scheme or parsed.netloc or relative_path.is_absolute():
-        raise ProjectNoteLinkError("Note link must be relative to the project.")
+    if parsed.scheme not in {"", "file"} or parsed.netloc or not parsed.path:
+        raise ProjectFileLinkError("Link must target a local project file.")
+    project_root = project_dir.resolve()
+    raw_path = unquote(parsed.path)
+    path = Path(raw_path) if Path(raw_path).is_absolute() else project_root / raw_path.removeprefix("./")
+    resolved = path.resolve()
+    if not resolved.is_relative_to(project_root):
+        raise ProjectFileLinkError("Link must stay inside the project.")
+    return resolved
+
+
+def relativize_project_links(markdown: str, project_dir: Path) -> str:
+    replacements: dict[str, str] = {}
+    for token in _MARKDOWN.parse(markdown):
+        if token.type != "inline":
+            continue
+        for child in token.children or []:
+            if child.type != "link_open":
+                continue
+            target = child.attrGet("href") or ""
+            try:
+                path = resolve_project_link_path(project_dir, target)
+            except ProjectFileLinkError:
+                continue
+            replacements[target] = path.relative_to(project_dir.resolve()).as_posix()
+    return _rewrite_markdown_links(markdown, replacements)
+
+
+def resolve_project_note(project_dir: Path, target: str) -> str:
+    try:
+        note_path = resolve_project_link_path(project_dir, target)
+    except ProjectFileLinkError as exc:
+        raise ProjectNoteLinkError(str(exc)) from exc
+    relative_path = note_path.relative_to(project_dir.resolve())
     if len(relative_path.parts) != 1 or relative_path.suffix.lower() != ".md":
         raise ProjectNoteLinkError("Note links must target a root-level Markdown note.")
-    note_path = (project_dir / relative_path).resolve()
-    if note_path.parent != project_dir.resolve() or not note_path.is_file():
+    if not note_path.is_file():
         raise ProjectNoteLinkError(f"Note not found: `{relative_path}`.")
     return relative_path.name
 
 
 def rewrite_project_note_links(markdown: str, project_dir: Path) -> tuple[str, tuple[str, ...]]:
+    markdown = relativize_project_links(markdown, project_dir)
     replacements: dict[str, str] = {}
     errors: list[str] = []
     for link in find_local_note_links(markdown):
         if link.target in replacements:
             continue
         try:
+            candidate = resolve_project_link_path(project_dir, link.target)
+            if candidate.suffix.lower() == ".md" and candidate.parent != project_dir.resolve():
+                continue
             note_name = resolve_project_note(project_dir, link.target)
         except ProjectNoteLinkError as exc:
             errors.append(str(exc))
             continue
+        except ProjectFileLinkError as exc:
+            errors.append(str(exc))
+            continue
         replacements[link.target] = workspace_hash(project_dir.name, note_name)
 
-    if not replacements:
-        return markdown, tuple(dict.fromkeys(errors))
+    return _rewrite_markdown_links(markdown, replacements), tuple(dict.fromkeys(errors))
 
+
+def _rewrite_markdown_links(markdown: str, replacements: dict[str, str]) -> str:
+    if not replacements:
+        return markdown
     protected_lines: set[int] = set()
     for token in _MARKDOWN.parse(markdown):
         if token.type in {"fence", "code_block"} and token.map:
@@ -133,7 +185,7 @@ def rewrite_project_note_links(markdown: str, project_dir: Path) -> tuple[str, t
             rewritten_lines.append(line)
         else:
             rewritten_lines.append(_rewrite_note_links_outside_code(line, replacements))
-    return "".join(rewritten_lines), tuple(dict.fromkeys(errors))
+    return "".join(rewritten_lines)
 
 
 def _rewrite_note_links_outside_code(line: str, replacements: dict[str, str]) -> str:
@@ -178,6 +230,54 @@ def _rewrite_note_links_outside_code(line: str, replacements: dict[str, str]) ->
             output.append(f"[{label}]({replacement})")
         cursor = target_end + 1
     return "".join(output)
+
+
+def find_standalone_project_file_links(
+    markdown: str,
+    project_dir: Path,
+) -> tuple[MarkdownFileLink, ...]:
+    links: list[MarkdownFileLink] = []
+    tokens = _MARKDOWN.parse(markdown)
+    for index in range(len(tokens) - 2):
+        opening, inline, closing = tokens[index : index + 3]
+        if (
+            opening.type != "paragraph_open"
+            or inline.type != "inline"
+            or closing.type != "paragraph_close"
+            or opening.map is None
+            or opening.level != 0
+        ):
+            continue
+        children = [
+            child
+            for child in (inline.children or [])
+            if child.type != "text" or child.content.strip()
+        ]
+        if len(children) != 3:
+            continue
+        link_open, label, link_close = children
+        if link_open.type != "link_open" or label.type != "text" or link_close.type != "link_close":
+            continue
+        target = link_open.attrGet("href") or ""
+        if label.content.strip().casefold() == "dataframe":
+            continue
+        try:
+            path = resolve_project_link_path(project_dir, target)
+        except ProjectFileLinkError:
+            continue
+        if path.suffix.lower() == ".md" and path.parent == project_dir.resolve():
+            continue
+        if not path.is_file():
+            continue
+        links.append(
+            MarkdownFileLink(
+                start_line=opening.map[0],
+                end_line=opening.map[1],
+                target=target,
+                title=label.content.strip() or path.name,
+            )
+        )
+    return tuple(links)
 
 
 def find_standalone_images(markdown: str) -> tuple[MarkdownImage, ...]:
