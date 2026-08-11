@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -70,6 +70,26 @@ from lightacademia.git_ops import (
     git_status_lines,
     git_sync,
     run_git,
+)
+from lightacademia.gardener import (
+    DEFAULT_FREQUENCY_MINUTES,
+    GardenerResult,
+    GardenerTask,
+    add_gardener_task,
+    build_gardener_followup_prompt,
+    build_gardener_script_prompt,
+    current_gardener_script,
+    due_gardener_tasks,
+    gardener_script_path,
+    load_gardener_tasks,
+    mark_gardener_finished,
+    mark_gardener_prepared,
+    mark_gardener_started,
+    parse_gardener_result,
+    remove_gardener_task,
+    request_gardener_run,
+    update_gardener_action,
+    update_gardener_frequency,
 )
 from lightacademia.markdown_preview import (
     ProjectDataframeError,
@@ -490,6 +510,25 @@ class AgentRunState:
     done: bool = False
 
 
+@dataclass
+class GardenerScriptRunState:
+    run_id: str
+    task: GardenerTask
+    project: Project
+    note_name: str
+    script_path: Path
+    tools_dir: Path
+    timeout_seconds: int
+    thread: threading.Thread | None = None
+    result: GardenerResult | None = None
+    command: list[str] | None = None
+    progress: queue.Queue[str] = field(default_factory=queue.Queue)
+    stdout: str = ""
+    stderr: str = ""
+    error: BaseException | None = None
+    done: bool = False
+
+
 @dataclass(frozen=True)
 class ToolDocument:
     name: str
@@ -498,6 +537,11 @@ class ToolDocument:
 
 @st.cache_resource
 def agent_runs() -> dict[str, AgentRunState]:
+    return {}
+
+
+@st.cache_resource
+def gardener_script_runs() -> dict[str, GardenerScriptRunState]:
     return {}
 
 
@@ -683,6 +727,109 @@ def add_action_dialog(project: Project, note) -> None:
             st.rerun()
         except OSError as exc:
             st.error(f"Could not add action: {exc}")
+
+
+@st.dialog("Add to Gardener", icon=":material/local_florist:")
+def add_gardener_action_dialog(notebook_dir: Path, project: Project, note, action: NoteAction) -> None:
+    st.markdown(f"Schedule **{action.name}** from `{project.name}/{note.name}`.")
+    frequency_minutes = st.number_input(
+        "Run every (minutes)",
+        min_value=1,
+        value=DEFAULT_FREQUENCY_MINUTES,
+        step=1,
+        key=f"gardener_frequency_{project.name}_{note.name}_{action.line}",
+    )
+    if st.button("Add to Gardener", type="primary", icon=":material/local_florist:"):
+        if active_agent_run() is not None:
+            st.warning("Wait for the current Robot run to finish before adding this action.")
+            return
+        task = add_gardener_task(
+            notebook_dir,
+            project_name=project.name,
+            note_name=note.name,
+            action_name=action.name,
+            instructions=action.instructions,
+            frequency_minutes=int(frequency_minutes),
+            action_line=action.line,
+        )
+        if not start_gardener_agent(
+            task,
+            project,
+            note,
+            build_gardener_script_prompt(task),
+            mode="prepare",
+        ):
+            mark_gardener_finished(
+                notebook_dir,
+                task.id,
+                status="error",
+                result="Could not start Robot script preparation.",
+            )
+        st.rerun()
+
+
+@st.dialog("Gardener", icon=":material/local_florist:")
+def gardener_dialog(notebook_dir: Path) -> None:
+    with st.container(key="gardener_dialog"):
+        illustration_col, content_col = st.columns([0.35, 0.65], gap="medium")
+        with illustration_col:
+            with st.container(key="gardener_illustration"):
+                st.image("assets/gardener.png", width="stretch")
+        with content_col:
+            tasks = load_gardener_tasks(notebook_dir)
+            if not tasks:
+                st.info("No actions have been added to Gardener.")
+                return
+
+            if st.button("Run all", icon=":material/play_arrow:", type="primary"):
+                request_gardener_run(notebook_dir, {task.id for task in tasks})
+                st.rerun()
+
+            for task in tasks:
+                with st.container(key=f"gardener_task_{task.id}"):
+                    st.markdown(f"<p class='la-gardener-action'>{html.escape(task.action_name)}</p>", unsafe_allow_html=True)
+                    st.caption(f"{task.project_name} / {task.note_name}")
+                    project_path = (notebook_dir.resolve() / task.project_name).resolve()
+                    cache_ready = project_path.is_dir() and current_gardener_script(project_path, task) is not None
+                    cache_status = "ready" if cache_ready else "needs Robot review"
+                    st.caption(f"Cached script: {cache_status}")
+                    if task.last_run_at:
+                        result = task.last_result or "No result recorded."
+                        st.caption(f"Last run: {task.last_run_at} · {task.last_status or 'unknown'} · {result}")
+                    else:
+                        st.caption("Last run: not yet run")
+
+                    frequency_col, run_col, remove_col = st.columns([0.53, 0.33, 0.14], vertical_alignment="bottom")
+                    with frequency_col:
+                        frequency_minutes = st.number_input(
+                            "Every (minutes)",
+                            min_value=1,
+                            value=task.frequency_minutes,
+                            step=1,
+                            key=f"gardener_task_frequency_{task.id}",
+                        )
+                        if int(frequency_minutes) != task.frequency_minutes:
+                            update_gardener_frequency(notebook_dir, task.id, int(frequency_minutes))
+                            st.rerun()
+                    with run_col:
+                        if st.button(
+                            "Run",
+                            key=f"run_gardener_task_{task.id}",
+                            icon=":material/play_arrow:",
+                            width="stretch",
+                        ):
+                            request_gardener_run(notebook_dir, {task.id})
+                            st.rerun()
+                    with remove_col:
+                        if st.button(
+                            ICON_BUTTON_LABEL,
+                            key=f"remove_gardener_task_{task.id}",
+                            icon=":material/delete:",
+                            help="Remove from Gardener",
+                            width="stretch",
+                        ):
+                            remove_gardener_task(notebook_dir, task.id)
+                            st.rerun()
 
 
 @st.dialog("Note history", icon=":material/history:")
@@ -928,6 +1075,11 @@ def init_state() -> None:
         "last_agent_error": None,
         "last_fast_action_result": None,
         "pending_fast_action_agent_notice": None,
+        "active_gardener_agent": None,
+        "active_gardener_script_run_id": None,
+        "gardener_progress_entries": [],
+        "gardener_notifications": [],
+        "last_gardener_result": None,
         "agent_running": False,
         "active_agent_run_id": None,
         "agent_progress_entries": [],
@@ -1832,15 +1984,29 @@ def render_project_markdown(
             action_key = hashlib.sha256(
                 f"{source_key}:{event.line}:{event.name}".encode("utf-8")
             ).hexdigest()[:16]
-            if st.button(
-                f"**Run:** {event.name}",
-                key=f"preview_action_{action_key}",
-                icon=":material/bolt:",
-                help="Select this action",
-            ):
-                st.session_state.requested_action = event
-                st.session_state.agent_chat_revision += 1
-                st.rerun()
+            with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                if st.button(
+                    f"**Run:** {event.name}",
+                    key=f"preview_action_{action_key}",
+                    icon=":material/bolt:",
+                    help="Select this action",
+                ):
+                    st.session_state.requested_action = event
+                    st.session_state.agent_chat_revision += 1
+                    st.rerun()
+                if st.button(
+                    ICON_BUTTON_LABEL,
+                    key=f"add_gardener_action_{action_key}",
+                    icon=":material/local_florist:",
+                    help="Add to Gardener",
+                ):
+                    action_project = Project(project_dir.name, project_dir)
+                    action_note = next(
+                        (candidate for candidate in list_notes(action_project) if candidate.name == note_name),
+                        None,
+                    )
+                    if action_note is not None:
+                        add_gardener_action_dialog(get_config().notebook_dir, action_project, action_note, event)
             with st.expander("Action description", expanded=False):
                 action_markdown = "".join(lines[start_line:end_line])
                 if action_markdown.strip():
@@ -2538,6 +2704,380 @@ def start_board_agent_command(
         return False
 
 
+def start_gardener_agent(
+    task: GardenerTask,
+    project: Project,
+    note,
+    prompt: str,
+    *,
+    mode: str,
+) -> bool:
+    if active_agent_run() is not None:
+        return False
+    try:
+        config = get_config()
+        run_state = start_agent_command(
+            project,
+            note,
+            prompt,
+            config.tools_dir,
+            config.agent,
+            config.agent_timeout_seconds,
+        )
+    except (OSError, GitError, AgentError):
+        return False
+    st.session_state.active_gardener_agent = {
+        "run_id": run_state.run_id,
+        "task_id": task.id,
+        "mode": mode,
+    }
+    if mode != "followup":
+        st.session_state.last_gardener_result = None
+    st.session_state.agent_chat_revision += 1
+    phase = "preparing a cached script for" if mode in {"prepare", "rebuild-run"} else "continuing"
+    queue_gardener_notification(
+        f"Gardener is {phase} {task.action_name}",
+        icon=":material/local_florist:",
+    )
+    logger.info("Started Gardener %s Robot run for task %s", mode, task.id)
+    return True
+
+
+def active_gardener_script_run() -> GardenerScriptRunState | None:
+    run_id = st.session_state.get("active_gardener_script_run_id")
+    if not isinstance(run_id, str):
+        return None
+    run_state = gardener_script_runs().get(run_id)
+    if run_state is None:
+        st.session_state.active_gardener_script_run_id = None
+    return run_state
+
+
+def queue_gardener_notification(message: str, *, icon: str) -> None:
+    notifications = st.session_state.setdefault("gardener_notifications", [])
+    notifications.append({"message": message, "icon": icon})
+
+
+def record_gardener_result(
+    task: GardenerTask,
+    *,
+    status: str,
+    summary: str,
+    details: object | None = None,
+) -> None:
+    st.session_state.last_gardener_result = {
+        "task_id": task.id,
+        "action_name": task.action_name,
+        "project_name": task.project_name,
+        "note_name": task.note_name,
+        "status": status,
+        "summary": summary,
+        "details": details,
+    }
+
+
+def drain_gardener_progress(run_state: GardenerScriptRunState) -> None:
+    entries = st.session_state.setdefault("gardener_progress_entries", [])
+    while True:
+        try:
+            entries.append(run_state.progress.get_nowait())
+        except queue.Empty:
+            break
+    while len(entries) > 250:
+        entries.pop(0)
+
+
+def start_gardener_script_run(
+    task: GardenerTask,
+    project: Project,
+    note,
+    script_path: Path,
+    tools_dir: Path,
+) -> GardenerScriptRunState:
+    run_id = uuid.uuid4().hex
+    run_state = GardenerScriptRunState(
+        run_id=run_id,
+        task=task,
+        project=project,
+        note_name=note.name,
+        script_path=script_path,
+        tools_dir=tools_dir,
+        timeout_seconds=get_config().agent_timeout_seconds,
+    )
+    run_state.thread = threading.Thread(
+        target=_gardener_script_worker,
+        args=(run_state,),
+        name=f"lightacademia-gardener-{run_id[:8]}",
+        daemon=True,
+    )
+    gardener_script_runs()[run_id] = run_state
+    st.session_state.active_gardener_script_run_id = run_id
+    st.session_state.last_gardener_result = None
+    st.session_state.gardener_progress_entries = [
+        f"[gardener]\nStarting cached action: {task.action_name}",
+        f"[command]\n{shlex.join([sys.executable, str(script_path.relative_to(project.path.resolve())), '--source-note', note.name])}",
+    ]
+    queue_gardener_notification(f"Gardener started: {task.action_name}", icon=":material/local_florist:")
+    run_state.thread.start()
+    return run_state
+
+
+def _gardener_script_worker(run_state: GardenerScriptRunState) -> None:
+    project_root = run_state.project.path.resolve()
+    environment = os.environ.copy()
+    environment["LIGHTACADEMIA_TOOLS"] = str(run_state.tools_dir.resolve())
+    try:
+        relative_script = run_state.script_path.resolve().relative_to(project_root)
+        command = [
+            sys.executable,
+            str(relative_script),
+            "--source-note",
+            run_state.note_name,
+        ]
+        run_state.command = command
+        process = subprocess.Popen(
+            command,
+            cwd=project_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+
+        def read_stream(stream, lines: list[str], stream_name: str) -> None:
+            for line in iter(stream.readline, ""):
+                lines.append(line)
+                text = line.rstrip()
+                if text:
+                    run_state.progress.put(f"[{stream_name}]\n{text}")
+            stream.close()
+
+        stdout_reader = threading.Thread(
+            target=read_stream,
+            args=(process.stdout, stdout_lines, "stdout"),
+            daemon=True,
+        )
+        stderr_reader = threading.Thread(
+            target=read_stream,
+            args=(process.stderr, stderr_lines, "stderr"),
+            daemon=True,
+        )
+        stdout_reader.start()
+        stderr_reader.start()
+        try:
+            returncode = process.wait(timeout=run_state.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            returncode = process.wait()
+            run_state.progress.put("[error]\nCached action timed out and was stopped.")
+        stdout_reader.join()
+        stderr_reader.join()
+        run_state.stdout = "".join(stdout_lines).strip()
+        run_state.stderr = "".join(stderr_lines).strip()
+        if returncode != 0:
+            run_state.result = GardenerResult(
+                robot=True,
+                status="error",
+                summary=f"Cached script failed with exit code {returncode}.",
+                details={"stdout": run_state.stdout[-4000:], "stderr": run_state.stderr[-4000:]},
+            )
+        else:
+            try:
+                run_state.result = parse_gardener_result(run_state.stdout)
+            except ValueError as exc:
+                run_state.result = GardenerResult(
+                    robot=True,
+                    status="error",
+                    summary=str(exc),
+                    details={"stdout": run_state.stdout[-4000:], "stderr": run_state.stderr[-4000:]},
+                )
+    except BaseException as exc:
+        run_state.error = exc
+    finally:
+        run_state.done = True
+
+
+def resolve_gardener_target(
+    notebook_dir: Path,
+    task: GardenerTask,
+) -> tuple[GardenerTask, Project, object] | None:
+    notebook_root = notebook_dir.resolve()
+    project_path = (notebook_root / task.project_name).resolve()
+    if not project_path.is_relative_to(notebook_root) or not project_path.is_dir():
+        mark_gardener_finished(
+            notebook_dir,
+            task.id,
+            status="error",
+            result=f"Project `{task.project_name}` was not found.",
+        )
+        return None
+    project = Project(task.project_name, project_path)
+    note = next((candidate for candidate in list_notes(project) if candidate.name == task.note_name), None)
+    if note is None:
+        mark_gardener_finished(
+            notebook_dir,
+            task.id,
+            status="error",
+            result=f"Note `{task.note_name}` was not found.",
+        )
+        return None
+    actions = parse_note_actions(read_note(note)).actions
+    action = next((candidate for candidate in actions if candidate.line == task.action_line), None)
+    if action is None or action.name != task.action_name:
+        action = next((candidate for candidate in actions if candidate.name == task.action_name), None)
+    if action is None:
+        mark_gardener_finished(
+            notebook_dir,
+            task.id,
+            status="error",
+            result=f"Action `{task.action_name}` was not found in `{task.note_name}`.",
+        )
+        return None
+    if (
+        action.name != task.action_name
+        or action.instructions != task.instructions
+        or action.line != task.action_line
+    ):
+        task = update_gardener_action(
+            notebook_dir,
+            task.id,
+            action_name=action.name,
+            instructions=action.instructions,
+            action_line=action.line,
+        ) or task
+    return task, project, note
+
+
+def finish_gardener_script_run(
+    notebook_dir: Path,
+    tools_dir: Path,
+    run_state: GardenerScriptRunState,
+) -> None:
+    gardener_script_runs().pop(run_state.run_id, None)
+    st.session_state.active_gardener_script_run_id = None
+    if run_state.error is not None:
+        mark_gardener_finished(
+            notebook_dir,
+            run_state.task.id,
+            status="error",
+            result=str(run_state.error),
+        )
+        record_gardener_result(
+            run_state.task,
+            status="error",
+            summary=str(run_state.error),
+        )
+        queue_gardener_notification(
+            f"Gardener failed: {run_state.task.action_name}",
+            icon=":material/error:",
+        )
+        return
+    result = run_state.result
+    if result is None:
+        mark_gardener_finished(
+            notebook_dir,
+            run_state.task.id,
+            status="error",
+            result="Cached script returned no result.",
+        )
+        record_gardener_result(
+            run_state.task,
+            status="error",
+            summary="Cached script returned no result.",
+        )
+        queue_gardener_notification(
+            f"Gardener failed: {run_state.task.action_name}",
+            icon=":material/error:",
+        )
+        return
+    if not result.robot:
+        mark_gardener_finished(
+            notebook_dir,
+            run_state.task.id,
+            status=result.status,
+            result=result.summary,
+        )
+        record_gardener_result(
+            run_state.task,
+            status=result.status,
+            summary=result.summary,
+            details={"stdout": run_state.stdout, "stderr": run_state.stderr, "result": result.details},
+        )
+        queue_gardener_notification(
+            f"Gardener finished: {run_state.task.action_name}",
+            icon=":material/check_circle:",
+        )
+        return
+    note = next(
+        (candidate for candidate in list_notes(run_state.project) if candidate.name == run_state.note_name),
+        None,
+    )
+    if note is None or not start_gardener_agent(
+        run_state.task,
+        run_state.project,
+        note,
+        build_gardener_followup_prompt(run_state.task, result),
+        mode="followup",
+    ):
+        mark_gardener_finished(
+            notebook_dir,
+            run_state.task.id,
+            status="error",
+            result="Cached script requested Robot assistance, but the Robot could not start.",
+        )
+        record_gardener_result(
+            run_state.task,
+            status="error",
+            summary="Cached script requested Robot assistance, but the Robot could not start.",
+            details={"stdout": run_state.stdout, "stderr": run_state.stderr, "result": result.details},
+        )
+        queue_gardener_notification(
+            f"Gardener needs attention: {run_state.task.action_name}",
+            icon=":material/error:",
+        )
+
+
+@st.fragment(run_every="5s")
+def render_gardener_scheduler(notebook_dir: Path, tools_dir: Path) -> None:
+    script_run = active_gardener_script_run()
+    if script_run is not None:
+        if script_run.done:
+            finish_gardener_script_run(notebook_dir, tools_dir, script_run)
+            st.rerun(scope="app")
+        return
+    if active_agent_run() is not None:
+        return
+    due_tasks = due_gardener_tasks(notebook_dir)
+    if not due_tasks:
+        return
+
+    target = resolve_gardener_target(notebook_dir, due_tasks[0])
+    if target is None:
+        return
+    task, project, note = target
+    mark_gardener_started(notebook_dir, task.id)
+    script_path = current_gardener_script(project.path, task)
+    if script_path is None:
+        if not start_gardener_agent(
+            task,
+            project,
+            note,
+            build_gardener_script_prompt(task),
+            mode="rebuild-run",
+        ):
+            mark_gardener_finished(
+                notebook_dir,
+                task.id,
+                status="error",
+                result="Could not start Robot script preparation.",
+            )
+    else:
+        start_gardener_script_run(task, project, note, script_path, tools_dir)
+    st.rerun(scope="app")
+
+
 def _agent_worker(run_state: AgentRunState) -> None:
     agent = default_agent(run_state.agent, timeout_seconds=run_state.agent_timeout_seconds)
     context = AgentContext(
@@ -2633,6 +3173,81 @@ def finish_agent_run(run_state: AgentRunState) -> None:
         st.session_state.last_agent_error = "Robot stopped."
     else:
         st.session_state.last_agent_error = f"Could not run robot: {run_state.error}"
+    gardener_agent = st.session_state.get("active_gardener_agent")
+    if isinstance(gardener_agent, dict) and gardener_agent.get("run_id") == run_state.run_id:
+        st.session_state.active_gardener_agent = None
+        notebook_dir = get_config().notebook_dir
+        task_id = gardener_agent.get("task_id")
+        mode = gardener_agent.get("mode")
+        task = next(
+            (candidate for candidate in load_gardener_tasks(notebook_dir) if candidate.id == task_id),
+            None,
+        )
+        if task is not None:
+            if run_state.error is not None:
+                mark_gardener_finished(
+                    notebook_dir,
+                    task.id,
+                    status="error",
+                    result=str(run_state.error),
+                )
+                record_gardener_result(task, status="error", summary=str(run_state.error))
+                queue_gardener_notification(
+                    f"Gardener failed: {task.action_name}",
+                    icon=":material/error:",
+                )
+            elif mode == "followup":
+                response = run_state.result.response if run_state.result is not None else "Completed."
+                mark_gardener_finished(
+                    notebook_dir,
+                    task.id,
+                    status="success",
+                    result=response,
+                )
+                record_gardener_result(task, status="success", summary=response)
+                queue_gardener_notification(
+                    f"Gardener finished: {task.action_name}",
+                    icon=":material/check_circle:",
+                )
+            else:
+                target = resolve_gardener_target(notebook_dir, task)
+                current_script = (
+                    current_gardener_script(target[1].path, target[0])
+                    if target is not None
+                    else None
+                )
+                if current_script is None:
+                    mark_gardener_finished(
+                        notebook_dir,
+                        task.id,
+                        status="error",
+                        result=f"Robot finished, but `{gardener_script_path(task)}` is missing or stale.",
+                    )
+                    record_gardener_result(
+                        task,
+                        status="error",
+                        summary=f"Robot finished, but `{gardener_script_path(task)}` is missing or stale.",
+                    )
+                    queue_gardener_notification(
+                        f"Gardener could not prepare: {task.action_name}",
+                        icon=":material/error:",
+                    )
+                elif mode == "rebuild-run":
+                    request_gardener_run(notebook_dir, {task.id})
+                    queue_gardener_notification(
+                        f"Gardener prepared {task.action_name}; starting cached action.",
+                        icon=":material/local_florist:",
+                    )
+                else:
+                    mark_gardener_prepared(
+                        notebook_dir,
+                        task.id,
+                        f"Cached script ready: {gardener_script_path(task)}",
+                    )
+                    queue_gardener_notification(
+                        f"Gardener prepared: {task.action_name}",
+                        icon=":material/check_circle:",
+                    )
     pending_notice = st.session_state.get("pending_fast_action_agent_notice")
     if isinstance(pending_notice, dict) and pending_notice.get("run_id") == run_state.run_id:
         st.session_state.pending_fast_action_agent_notice = None
@@ -2677,6 +3292,42 @@ def render_fast_action_completion(project: Project, note) -> None:
             st.code(error_output)
 
 
+def render_gardener_completion() -> None:
+    result = st.session_state.get("last_gardener_result")
+    if not isinstance(result, dict):
+        return
+    action_name = result.get("action_name")
+    summary = result.get("summary")
+    status = result.get("status")
+    if not isinstance(action_name, str) or not isinstance(summary, str) or not summary:
+        return
+
+    summary_col, dismiss_col = st.columns([0.94, 0.06], vertical_alignment="top")
+    with summary_col:
+        if status == "success":
+            st.success(f"Gardener completed **{action_name}**.", icon=":material/check_circle:")
+        else:
+            st.warning(f"Gardener finished **{action_name}** with status `{status or 'unknown'}`.")
+        st.markdown(summary)
+    with dismiss_col:
+        if st.button(
+            ICON_BUTTON_LABEL,
+            key="dismiss_gardener_result",
+            help="Dismiss Gardener result",
+            icon=":material/close:",
+        ):
+            st.session_state.last_gardener_result = None
+            st.rerun()
+
+    details = result.get("details")
+    if details is not None:
+        with st.expander("Gardener details", expanded=False):
+            if isinstance(details, str):
+                st.code(details)
+            else:
+                st.code(json.dumps(details, ensure_ascii=False, indent=2, default=str), language="json")
+
+
 def render_agent_completion() -> None:
     response = st.session_state.get("last_agent_response")
     if not isinstance(response, str) or not response:
@@ -2697,6 +3348,20 @@ def render_agent_completion() -> None:
         st.markdown(response)
 
 
+def render_gardener_notifications() -> None:
+    notifications = st.session_state.get("gardener_notifications")
+    if not isinstance(notifications, list):
+        return
+    st.session_state.gardener_notifications = []
+    for notification in notifications:
+        if not isinstance(notification, dict):
+            continue
+        message = notification.get("message")
+        icon = notification.get("icon")
+        if isinstance(message, str) and message:
+            st.toast(message, icon=icon if isinstance(icon, str) else None)
+
+
 def render_agent_panel(project: Project, note, actions: tuple[NoteAction, ...], tools_dir: Path) -> None:
     run_state = active_agent_run()
     agent_chat_revision = st.session_state.get("agent_chat_revision", 0)
@@ -2709,6 +3374,8 @@ def render_agent_panel(project: Project, note, actions: tuple[NoteAction, ...], 
         ):
             if run_state is not None:
                 render_agent_progress_panel()
+            elif active_gardener_script_run() is not None:
+                render_gardener_script_progress_panel()
             else:
                 render_agent_form(project, note, actions, tools_dir)
 
@@ -2738,6 +3405,24 @@ def render_agent_progress_panel() -> None:
         )
     if run_state.done:
         finish_agent_run(run_state)
+        st.rerun(scope="app")
+
+
+@st.fragment(run_every="250ms")
+def render_gardener_script_progress_panel() -> None:
+    run_state = active_gardener_script_run()
+    if run_state is None:
+        return
+    drain_gardener_progress(run_state)
+    entries = st.session_state.get("gardener_progress_entries", [])
+    with st.status(f"🌿 Gardener is running {run_state.task.action_name}...", expanded=True, state="running"):
+        st.caption("Running the cached action script")
+        st.container(height=220, border=False).code(
+            "\n\n".join(entries) if entries else "Waiting for cached action output...",
+            language=None,
+        )
+    if run_state.done:
+        finish_gardener_script_run(get_config().notebook_dir, get_config().tools_dir, run_state)
         st.rerun(scope="app")
 
 
@@ -3055,6 +3740,13 @@ def main() -> None:
                 chat_history_dialog(project)
             if st.button(
                 ICON_BUTTON_LABEL,
+                key="open_gardener",
+                help="Gardener",
+                icon=":material/local_florist:",
+            ):
+                gardener_dialog(notebook_dir)
+            if st.button(
+                ICON_BUTTON_LABEL,
                 key="open_settings",
                 help="Settings",
                 icon=":material/settings:",
@@ -3156,10 +3848,13 @@ def main() -> None:
                 st.session_state.last_agent_error = None
                 st.rerun()
     render_fast_action_completion(project, note)
+    render_gardener_completion()
     render_agent_completion()
+    render_gardener_notifications()
 
     if not is_history_view:
         render_agent_panel(project, note, action_result.actions, tools_dir)
+    render_gardener_scheduler(notebook_dir, tools_dir)
 
 
 if __name__ == "__main__":

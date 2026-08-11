@@ -440,6 +440,82 @@ section[data-testid="stDialog"] > div {
     border-radius: 8px;
 }
 
+section[data-testid="stDialog"]:has(.st-key-gardener_dialog) > div {
+    width: min(84rem, calc(100vw - 3rem));
+    max-width: min(84rem, calc(100vw - 3rem));
+}
+
+.st-key-gardener_dialog > [data-testid="stVerticalBlock"] {
+    gap: 0.8rem;
+}
+
+.st-key-gardener_illustration {
+    position: sticky;
+    top: 0.35rem;
+    padding-top: 0.25rem;
+    opacity: 0.96;
+}
+
+.st-key-gardener_illustration img {
+    display: block;
+    object-fit: contain;
+}
+
+.st-key-gardener_dialog > [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:has(.st-key-gardener_task_) {
+    margin-top: 0.15rem;
+}
+
+[class*="st-key-gardener_task_"] {
+    padding: 0.85rem;
+    border: 1px solid var(--la-line);
+    border-left: 3px solid var(--la-sage);
+    border-radius: 7px;
+    background: rgba(238, 231, 215, 0.34);
+}
+
+[class*="st-key-gardener_task_"] [data-testid="stVerticalBlock"] {
+    gap: 0.3rem;
+}
+
+.la-gardener-action {
+    margin: 0 0 0.1rem;
+    color: var(--la-ink);
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+    font-size: 1.05rem;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+[class*="st-key-gardener_task_"] [data-testid="stCaptionContainer"] {
+    margin: 0;
+    color: var(--la-muted);
+    font-size: 0.8rem;
+    line-height: 1.35;
+}
+
+[class*="st-key-gardener_task_"] [data-testid="stNumberInput"] label {
+    color: var(--la-ink);
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+[class*="st-key-gardener_task_"] button {
+    min-height: 2.45rem;
+}
+
+[class*="st-key-run_gardener_task_"] button,
+[class*="st-key-run_gardener_task_"] button p {
+    white-space: nowrap;
+}
+
+[class*="st-key-gardener_task_"] [class*="st-key-remove_gardener_task_"] button {
+    padding-inline: 0;
+}
+
+[class*="st-key-gardener_task_"] [class*="st-key-remove_gardener_task_"] button p {
+    display: none;
+}
+
 @media (max-width: 640px) {
     .block-container {
         padding-top: 1rem;
