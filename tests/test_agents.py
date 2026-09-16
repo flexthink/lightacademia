@@ -3,45 +3,42 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from lightacademia.agents import (
     AgentContext,
     AgentProgress,
     AgentStopped,
     ClaudeCliAgent,
-    CodexCliAgent,
+    CodexSdkAgent,
     available_agent_models,
     create_agent,
     claude_progress_from_event,
     claude_tool_action_from_event,
+    codex_event_from_notification,
     codex_progress_from_event,
     codex_tool_action_from_event,
 )
 
 
 class CodexProgressTest(unittest.TestCase):
-    @patch("lightacademia.agents.shutil.which", return_value="/usr/local/bin/codex")
-    @patch("lightacademia.agents.subprocess.run")
-    def test_codex_lists_models_with_cli(self, run, _which) -> None:
-        run.return_value.returncode = 0
-        run.return_value.stdout = '{"models":[{"slug":"gpt-5-codex"},{"slug":"gpt-4.1"}]}'
-        run.return_value.stderr = ""
+    @patch("lightacademia.agents.Codex")
+    def test_codex_lists_models_with_sdk(self, codex_class) -> None:
+        codex = codex_class.return_value.__enter__.return_value
+        codex.models.return_value.data = [
+            SimpleNamespace(model="gpt-5-codex"),
+            SimpleNamespace(model="gpt-4.1"),
+        ]
 
-        self.assertEqual(CodexCliAgent().available_models(), ["gpt-5-codex", "gpt-4.1"])
-        run.assert_called_once_with(
-            ["/usr/local/bin/codex", "debug", "models"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        self.assertEqual(CodexSdkAgent().available_models(), ["gpt-5-codex", "gpt-4.1"])
+        codex.models.assert_called_once_with()
 
     def test_agents_without_model_capability_do_not_list_models(self) -> None:
         self.assertIsNone(available_agent_models("claude"))
 
     def test_builds_prompt_from_external_template(self) -> None:
-        agent = CodexCliAgent()
+        agent = CodexSdkAgent()
         context = AgentContext(
             project_dir=Path("/project"),
             project_name="Research",
@@ -57,49 +54,15 @@ class CodexProgressTest(unittest.TestCase):
         self.assertNotIn("{{project_name}}", prompt)
         self.assertNotIn("{{user_prompt}}", prompt)
 
-    def test_codex_command_enables_workspace_network_access(self) -> None:
-        agent = CodexCliAgent(network_access=True)
-        context = AgentContext(
-            project_dir=Path("/project"),
-            project_name="project",
-            tools_dir=Path("/tools"),
-            current_note="Home.md",
-        )
-
-        command = agent._build_command(
-            "codex",
-            context,
-            Path("/temporary/tools"),
-            Path("/temporary/last-message.md"),
-        )
-
-        self.assertIn("sandbox_workspace_write.network_access=true", command)
-
-    def test_codex_command_selects_model(self) -> None:
-        agent = CodexCliAgent(model="gpt-5-codex")
-        context = AgentContext(
-            project_dir=Path("/project"),
-            project_name="project",
-            tools_dir=Path("/tools"),
-            current_note="Home.md",
-        )
-
-        command = agent._build_command(
-            "codex", context, Path("/temporary/tools"), Path("/temporary/last-message.md")
-        )
-
-        self.assertIn("--model", command)
-        self.assertIn("gpt-5-codex", command)
-
     def test_builds_runtime_tools_environment(self) -> None:
-        agent = CodexCliAgent()
+        agent = CodexSdkAgent()
 
         environment = agent._build_environment(Path("/temporary/tools"))
 
         self.assertEqual(environment["LIGHTACADEMIA_TOOLS"], "/temporary/tools")
 
     def test_prompt_requires_runtime_tools_environment(self) -> None:
-        agent = CodexCliAgent()
+        agent = CodexSdkAgent()
         context = AgentContext(
             project_dir=Path("/project"),
             project_name="project",
@@ -132,8 +95,8 @@ class CodexProgressTest(unittest.TestCase):
         self.assertIn("Bash", command)
         self.assertNotIn("-", command)
 
-    def test_create_agent_selects_cli_implementation(self) -> None:
-        self.assertIsInstance(create_agent("codex"), CodexCliAgent)
+    def test_create_agent_selects_implementation(self) -> None:
+        self.assertIsInstance(create_agent("codex"), CodexSdkAgent)
         self.assertIsInstance(create_agent("claude"), ClaudeCliAgent)
 
     def test_create_agent_applies_timeout(self) -> None:
@@ -209,38 +172,45 @@ class CodexProgressTest(unittest.TestCase):
         self.assertIn("$ ls data", progress.text)
         self.assertEqual(action, "ls data")
 
-    def test_streams_jsonl_subprocess_without_model_call(self) -> None:
-        script = """
-import json
-import os
-import sys
-
-sys.stdin.read()
-events = [
-    {"type": "turn.started"},
-    {"type": "item.completed", "item": {"type": "reasoning", "text": "Checking files."}},
-    {"type": "item.started", "item": {"type": "command_execution", "command": "ls"}},
-    {"type": "item.completed", "item": {"type": "agent_message", "text": os.environ["LIGHTACADEMIA_TOOLS"]}},
-]
-for event in events:
-    print(json.dumps(event), flush=True)
-print("diagnostic", file=sys.stderr, flush=True)
-"""
-        progress: list[AgentProgress] = []
-        agent = CodexCliAgent(timeout_seconds=5)
-
-        result = agent._run_streaming(
-            [sys.executable, "-u", "-c", script],
-            "test prompt",
-            progress.append,
-            environment=agent._build_environment(Path("/temporary/tools")),
+    def test_translates_typed_sdk_notification(self) -> None:
+        payload = MagicMock()
+        payload.model_dump.return_value = {
+            "item": {"type": "commandExecution", "command": "ls data"}
+        }
+        event = codex_event_from_notification(
+            SimpleNamespace(method="item/started", payload=payload)
         )
 
-        self.assertEqual(result["returncode"], 0)
-        self.assertEqual(result["last_agent_message"], "/temporary/tools")
-        self.assertEqual(result["tool_actions"], ["ls"])
-        self.assertIn("diagnostic", result["stderr"])
-        self.assertTrue(any("Checking files" in item.text for item in progress))
+        self.assertEqual(event["type"], "item.started")
+        self.assertEqual(event["item"]["type"], "command_execution")
+        self.assertEqual(codex_tool_action_from_event(event), "ls data")
+
+    @patch("lightacademia.agents.Codex")
+    def test_codex_runs_through_sdk_thread(self, codex_class) -> None:
+        codex = codex_class.return_value.__enter__.return_value
+        thread = codex.thread_start.return_value
+        turn = thread.turn.return_value
+        payload = MagicMock()
+        payload.model_dump.return_value = {
+            "item": {"type": "agentMessage", "text": "Done."}
+        }
+        turn.stream.return_value = [
+            SimpleNamespace(method="item/completed", payload=payload)
+        ]
+        context = AgentContext(
+            project_dir=Path("/project"),
+            project_name="project",
+            tools_dir=Path("/missing-tools"),
+            current_note="Home.md",
+        )
+
+        result = CodexSdkAgent(model="gpt-test").run("Finish it.", context)
+
+        self.assertEqual(result.response, "Done.")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(codex.thread_start.call_args.kwargs["cwd"], "/project")
+        self.assertEqual(codex.thread_start.call_args.kwargs["model"], "gpt-test")
+        self.assertIn("Finish it.", thread.turn.call_args.args[0])
 
     def test_streams_claude_jsonl_subprocess_without_model_call(self) -> None:
         script = """
@@ -288,7 +258,7 @@ print(json.dumps({"type": "turn.started"}), flush=True)
 time.sleep(30)
 """
         progress: list[AgentProgress] = []
-        agent = CodexCliAgent(timeout_seconds=30)
+        agent = ClaudeCliAgent(timeout_seconds=30)
 
         with self.assertRaises(AgentStopped):
             agent._run_streaming(

@@ -579,7 +579,7 @@ def get_config() -> AppConfig:
     parser.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--autocommit-seconds", type=int, default=DEFAULT_AUTOCOMMIT_SECONDS)
     parser.add_argument("--agent", choices=("codex", "claude"), default="codex")
-    parser.add_argument("--codex-model", default=None, help="Model passed to the Codex CLI.")
+    parser.add_argument("--codex-model", default=None, help="Model passed to the Codex SDK.")
     parser.add_argument("--agent-timeout-seconds", type=int, default=3600)
     args, _ = parser.parse_known_args()
     return AppConfig(

@@ -212,7 +212,7 @@ Fetch experiments from the cluster that have run within the last week.
 - A log of agent chats is kept in {project}/chats/{YYYY-mm-dd}.md
 - When an agent action is executed, an entry is appended to the chat log for that day.
 - While an agent action is running, the pinned agent section displays a real-time activity feed
-- The Codex implementation uses `codex exec --json` and renders its JSONL events deterministically without an additional LLM call
+- The Codex implementation uses the official Python SDK and renders its typed events deterministically without an additional LLM call
 - The activity feed includes emitted reasoning, agent messages, commands and command output, file changes, tool calls, plan updates, errors, and usage events
 - Agent execution remains non-interactive and does not prompt the user for input
 - The chat log should include
@@ -222,7 +222,7 @@ Fetch experiments from the cluster that have run within the last week.
     - File changes
 - Agent context and permissions
     - Agent implementations are accessed through an application-level agent abstraction
-    - The initial agent implementation uses the Codex CLI in non-interactive mode
+    - The agent implementation uses the official Codex Python SDK
     - The agent may read files in the selected project
     - The agent may update files only in the selected project
     - The agent may write derived artifacts into the selected project's `data` directory

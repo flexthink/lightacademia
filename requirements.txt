@@ -6,3 +6,4 @@ streamlit-extras
 bm25s
 pandas
 tabulate
+openai-codex>=0.154,<0.155

@@ -157,16 +157,16 @@ python -m streamlit run app.py -- --agent claude
 ```
 
 When using Codex, select a specific model with `--codex-model`; omit it to use
-the model selected by the installed Codex CLI:
+the model selected by the Codex SDK runtime:
 
 ```bash
 python -m streamlit run app.py -- --agent codex --codex-model gpt-5-codex
 ```
 
-The default implementation uses the Codex CLI:
+The default implementation uses the official Codex Python SDK:
 
-- Runs `codex exec`
-- Uses `codex exec --json` to stream detailed progress into the pinned agent section
+- Uses `openai-codex`, including its pinned local Codex app-server runtime
+- Streams typed SDK notifications into the pinned agent section
 - Displays Codex events directly without a separate summarization model call
 - Uses the selected project as the working root
 - Adds a temporary copy of the configured tools folder as an auxiliary workspace
