@@ -156,6 +156,13 @@ python -m streamlit run app.py -- --agent codex
 python -m streamlit run app.py -- --agent claude
 ```
 
+When using Codex, select a specific model with `--codex-model`; omit it to use
+the model selected by the installed Codex CLI:
+
+```bash
+python -m streamlit run app.py -- --agent codex --codex-model gpt-5-codex
+```
+
 The default implementation uses the Codex CLI:
 
 - Runs `codex exec`

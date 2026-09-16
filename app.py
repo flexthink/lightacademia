@@ -13,6 +13,7 @@ import mimetypes
 import os
 import queue
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ from urllib.parse import quote
 import pandas as pd
 import streamlit as st
 import streamlit_extras.resizable_columns as resizable_columns_module
+from tabulate import tabulate
 from streamlit.components.v2.get_bidi_component_manager import get_bidi_component_manager
 from streamlit.components.v2.manifest_scanner import ComponentConfig, ComponentManifest
 from streamlit_extras.resizable_columns import resizable_columns
@@ -41,6 +43,7 @@ from lightacademia.agents import (
     AgentProgress,
     AgentResult,
     AgentStopped,
+    available_agent_models,
     default_agent,
 )
 from lightacademia.boards import (
@@ -83,11 +86,13 @@ from lightacademia.gardener import (
     gardener_script_path,
     load_gardener_tasks,
     mark_gardener_finished,
+    mark_gardener_process_started,
     mark_gardener_prepared,
     mark_gardener_started,
     parse_gardener_result,
     remove_gardener_task,
     request_gardener_run,
+    reset_interrupted_gardener_tasks,
     update_gardener_action,
     update_gardener_frequency,
 )
@@ -259,6 +264,11 @@ body,
 .ace_scroller,
 .ace_content {
   background: #fffaf1 !important;
+}
+.streamlit_code-editor,
+.ace_editor {
+  height: 100vh !important;
+  min-height: 0 !important;
 }
 .ace-streamlit-light,
 .ace-streamlit-light .ace_gutter {
@@ -488,6 +498,7 @@ class AppConfig:
     tools_dir: Path
     autocommit_seconds: int
     agent: str
+    codex_model: str | None
     agent_timeout_seconds: int
 
 
@@ -499,6 +510,7 @@ class AgentRunState:
     prompt: str
     tools_dir: Path
     agent: str
+    codex_model: str | None
     agent_timeout_seconds: int
     before_status: set[str]
     progress: queue.Queue[AgentProgress]
@@ -514,12 +526,15 @@ class AgentRunState:
 class GardenerScriptRunState:
     run_id: str
     task: GardenerTask
+    notebook_dir: Path
     project: Project
     note_name: str
     script_path: Path
     tools_dir: Path
     timeout_seconds: int
+    stop_requested: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    process: subprocess.Popen[str] | None = None
     result: GardenerResult | None = None
     command: list[str] | None = None
     progress: queue.Queue[str] = field(default_factory=queue.Queue)
@@ -545,6 +560,18 @@ def gardener_script_runs() -> dict[str, GardenerScriptRunState]:
     return {}
 
 
+@st.cache_resource
+def reset_gardener_tasks_at_startup(notebook_dir: str) -> int:
+    """Run once per app process so abandoned work is not left busy forever."""
+    return reset_interrupted_gardener_tasks(Path(notebook_dir))
+
+
+@st.cache_resource
+def agent_model_preferences() -> dict[str, str]:
+    """Keep model choices across browser refreshes for this app process."""
+    return {}
+
+
 @lru_cache(maxsize=1)
 def get_config() -> AppConfig:
     parser = argparse.ArgumentParser(add_help=False)
@@ -552,6 +579,7 @@ def get_config() -> AppConfig:
     parser.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--autocommit-seconds", type=int, default=DEFAULT_AUTOCOMMIT_SECONDS)
     parser.add_argument("--agent", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--codex-model", default=None, help="Model passed to the Codex CLI.")
     parser.add_argument("--agent-timeout-seconds", type=int, default=3600)
     args, _ = parser.parse_known_args()
     return AppConfig(
@@ -559,8 +587,22 @@ def get_config() -> AppConfig:
         tools_dir=args.tools.expanduser(),
         autocommit_seconds=max(30, args.autocommit_seconds),
         agent=args.agent,
+        codex_model=args.codex_model.strip() if args.codex_model and args.codex_model.strip() else None,
         agent_timeout_seconds=max(60, args.agent_timeout_seconds),
     )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def selectable_agent_models(agent: str, codex_model: str | None) -> list[str] | None:
+    """Cache the account lookup while leaving model support optional per agent."""
+    return available_agent_models(agent, codex_model=codex_model)
+
+
+def remember_selected_agent_model(agent: str, widget_key: str) -> None:
+    selected_model = st.session_state.get(widget_key)
+    if isinstance(selected_model, str) and selected_model:
+        st.session_state.last_agent_model = selected_model
+        agent_model_preferences()[agent] = selected_model
 
 
 @st.dialog("New project", icon=":material/create_new_folder:")
@@ -785,6 +827,10 @@ def gardener_dialog(notebook_dir: Path) -> None:
                 request_gardener_run(notebook_dir, {task.id for task in tasks})
                 st.rerun()
 
+            active_script_run = active_gardener_script_run()
+            active_robot_run = active_agent_run()
+            active_robot_gardener = st.session_state.get("active_gardener_agent")
+
             for task in tasks:
                 with st.container(key=f"gardener_task_{task.id}"):
                     st.markdown(f"<p class='la-gardener-action'>{html.escape(task.action_name)}</p>", unsafe_allow_html=True)
@@ -799,7 +845,13 @@ def gardener_dialog(notebook_dir: Path) -> None:
                     else:
                         st.caption("Last run: not yet run")
 
-                    frequency_col, run_col, remove_col = st.columns([0.53, 0.33, 0.14], vertical_alignment="bottom")
+                    is_running_script = active_script_run is not None and active_script_run.task.id == task.id
+                    is_running_robot = (
+                        isinstance(active_robot_gardener, dict)
+                        and active_robot_gardener.get("task_id") == task.id
+                        and active_robot_run is not None
+                    )
+                    frequency_col, run_col, stop_col, remove_col = st.columns([0.43, 0.25, 0.18, 0.14], vertical_alignment="bottom")
                     with frequency_col:
                         frequency_minutes = st.number_input(
                             "Every (minutes)",
@@ -817,9 +869,33 @@ def gardener_dialog(notebook_dir: Path) -> None:
                             key=f"run_gardener_task_{task.id}",
                             icon=":material/play_arrow:",
                             width="stretch",
+                            disabled=is_running_script or is_running_robot,
                         ):
                             request_gardener_run(notebook_dir, {task.id})
                             st.rerun()
+                    with stop_col:
+                        if is_running_script:
+                            stopping = active_script_run.stop_requested.is_set()
+                            if st.button(
+                                "Stopping" if stopping else "Stop",
+                                key=f"stop_gardener_script_{task.id}",
+                                icon=":material/stop_circle:",
+                                disabled=stopping,
+                                width="stretch",
+                            ):
+                                stop_gardener_script_run(active_script_run)
+                                st.rerun()
+                        elif is_running_robot:
+                            stopping = active_robot_run.stop_requested.is_set()
+                            if st.button(
+                                "Stopping" if stopping else "Stop",
+                                key=f"stop_gardener_robot_{task.id}",
+                                icon=":material/stop_circle:",
+                                disabled=stopping,
+                                width="stretch",
+                            ):
+                                active_robot_run.stop_requested.set()
+                                st.rerun()
                     with remove_col:
                         if st.button(
                             ICON_BUTTON_LABEL,
@@ -1089,6 +1165,7 @@ def init_state() -> None:
         "board_action_needs_app_rerun": False,
         "pending_fast_board_action": None,
         "agent_chat_revision": 0,
+        "last_agent_model": None,
         "source_visible": False,
         "editor_cursors": {},
         "history_revision": None,
@@ -1650,7 +1727,8 @@ def render_tool_code_editor(path: Path) -> str:
             height=[34, 34],
             key=key,
             response_mode=["debounce", "blur"],
-            options={"wrap": True, "fontSize": 14},
+            options={"wrap": True, "fontSize": 14, "scrollPastEnd": 0.5},
+            props={"scrollMargin": [15, 160, 0, 0]},
             component_props={"css": EDITOR_COMPONENT_CSS},
         )
         return editor_response_content(response, content)
@@ -1720,7 +1798,8 @@ def render_editor(note) -> str:
             height=[34, 34],
             key=key,
             response_mode=["debounce", "blur"],
-            options={"wrap": True, "fontSize": 14},
+            options={"wrap": True, "fontSize": 14, "scrollPastEnd": 0.5},
+            props={"scrollMargin": [15, 160, 0, 0]},
             component_props={"css": EDITOR_COMPONENT_CSS},
         )
         remember_editor_cursor(note, response)
@@ -2038,6 +2117,8 @@ def render_project_markdown(
                     dataframe_path,
                     project_dir,
                     columns=event.columns,
+                    filters=event.filters,
+                    dataframe_key=f"{source_key}:{start_line}:{event.target}",
                     annotation_error=event.annotation_error,
                 )
         elif event_type == "file":
@@ -2096,6 +2177,8 @@ def render_project_dataframe(
     dataframe_path: Path,
     project_dir: Path,
     columns: dict[str, str] | None = None,
+    filters: tuple[BoardFilter, ...] = (),
+    dataframe_key: str = "dataframe",
     annotation_error: str | None = None,
 ) -> None:
     project_root = project_dir.resolve()
@@ -2105,12 +2188,47 @@ def render_project_dataframe(
     except Exception as exc:
         st.warning(f"Could not read dataframe `{relative_path}`: {exc}")
         return
+    dataframe = render_dataframe_filters(filters, dataframe, dataframe_key, source_name="Dataframe")
     if columns:
         dataframe = dataframe.rename(columns=columns)
     if annotation_error:
         st.warning(annotation_error)
     st.caption(str(relative_path))
+    copy_key = hashlib.sha256(
+        f"dataframe:{dataframe_path.resolve()}:{dataframe.to_csv(index=False)}".encode("utf-8")
+    ).hexdigest()[:16]
+    copy_table_buttons_component()(
+        data={
+            "markdownText": format_dataframe_for_plain_text(dataframe),
+            "latexText": format_dataframe_for_latex(dataframe),
+        },
+        key=f"copy_dataframe_buttons_{copy_key}",
+        height=42,
+    )
     st.dataframe(dataframe, width="stretch", height=360)
+
+
+def dataframe_copy_rows(dataframe: pd.DataFrame) -> list[list[object]]:
+    normalized = dataframe.astype(object).where(pd.notna(dataframe), "")
+    return normalized.values.tolist()
+
+
+def format_dataframe_for_plain_text(dataframe: pd.DataFrame) -> str:
+    return tabulate(
+        dataframe_copy_rows(dataframe),
+        headers=[str(column) for column in dataframe.columns],
+        tablefmt="github",
+        disable_numparse=True,
+    )
+
+
+def format_dataframe_for_latex(dataframe: pd.DataFrame) -> str:
+    return tabulate(
+        dataframe_copy_rows(dataframe),
+        headers=[str(column) for column in dataframe.columns],
+        tablefmt="latex_booktabs",
+        disable_numparse=True,
+    )
 
 
 def queue_agent_prompt(prompt: str) -> None:
@@ -2139,15 +2257,25 @@ def render_board_filters(
     dataframe: pd.DataFrame,
     board_key: str,
 ) -> pd.DataFrame:
-    if not board_filters:
+    return render_dataframe_filters(board_filters, dataframe, board_key, source_name="Board")
+
+
+def render_dataframe_filters(
+    filters: tuple[BoardFilter, ...],
+    dataframe: pd.DataFrame,
+    filter_key: str,
+    *,
+    source_name: str,
+) -> pd.DataFrame:
+    if not filters:
         return dataframe
 
     columns_by_name = {str(column).casefold(): str(column) for column in dataframe.columns}
     configured_filters: list[tuple[BoardFilter, str]] = []
-    for board_filter in board_filters:
+    for board_filter in filters:
         dataframe_column = columns_by_name.get(board_filter.column.casefold())
         if dataframe_column is None:
-            st.warning(f"Board filter column `{board_filter.column}` is not present in the CSV.")
+            st.warning(f"{source_name} filter column `{board_filter.column}` is not present in the CSV.")
             continue
         configured_filters.append((board_filter, dataframe_column))
 
@@ -2157,7 +2285,7 @@ def render_board_filters(
         columns = st.columns(len(filter_row))
         for offset, ((board_filter, dataframe_column), column) in enumerate(zip(filter_row, columns)):
             filter_index = row_start + offset
-            widget_key = f"board_filter_{board_key}_{filter_index}"
+            widget_key = f"{source_name.casefold()}_filter_{filter_key}_{filter_index}"
             with column:
                 if board_filter.filter_type == "dropdown":
                     options = sorted(
@@ -2634,6 +2762,7 @@ def start_agent_command(
     prompt: str,
     tools_dir: Path,
     agent: str,
+    codex_model: str | None,
     agent_timeout_seconds: int,
 ) -> AgentRunState:
     save_editor_state(note)
@@ -2648,6 +2777,7 @@ def start_agent_command(
         prompt=prompt,
         tools_dir=tools_dir,
         agent=agent,
+        codex_model=codex_model,
         agent_timeout_seconds=agent_timeout_seconds,
         before_status=set(git_status_lines(project.path)),
         progress=queue.Queue(),
@@ -2693,6 +2823,7 @@ def start_board_agent_command(
             prompt.strip(),
             config.tools_dir,
             config.agent,
+            config.codex_model,
             config.agent_timeout_seconds,
         )
         st.session_state.last_agent_error = None
@@ -2722,6 +2853,7 @@ def start_gardener_agent(
             prompt,
             config.tools_dir,
             config.agent,
+            config.codex_model,
             config.agent_timeout_seconds,
         )
     except (OSError, GitError, AgentError):
@@ -2789,6 +2921,7 @@ def drain_gardener_progress(run_state: GardenerScriptRunState) -> None:
 
 def start_gardener_script_run(
     task: GardenerTask,
+    notebook_dir: Path,
     project: Project,
     note,
     script_path: Path,
@@ -2798,6 +2931,7 @@ def start_gardener_script_run(
     run_state = GardenerScriptRunState(
         run_id=run_id,
         task=task,
+        notebook_dir=notebook_dir,
         project=project,
         note_name=note.name,
         script_path=script_path,
@@ -2827,6 +2961,9 @@ def _gardener_script_worker(run_state: GardenerScriptRunState) -> None:
     environment = os.environ.copy()
     environment["LIGHTACADEMIA_TOOLS"] = str(run_state.tools_dir.resolve())
     try:
+        if run_state.stop_requested.is_set():
+            run_state.result = GardenerResult(False, "stopped", "Cached action stopped by user.")
+            return
         relative_script = run_state.script_path.resolve().relative_to(project_root)
         command = [
             sys.executable,
@@ -2842,7 +2979,10 @@ def _gardener_script_worker(run_state: GardenerScriptRunState) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
+            start_new_session=True,
         )
+        run_state.process = process
+        mark_gardener_process_started(run_state.notebook_dir, run_state.task.id, process.pid)
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
 
@@ -2866,17 +3006,31 @@ def _gardener_script_worker(run_state: GardenerScriptRunState) -> None:
         )
         stdout_reader.start()
         stderr_reader.start()
-        try:
-            returncode = process.wait(timeout=run_state.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            returncode = process.wait()
-            run_state.progress.put("[error]\nCached action timed out and was stopped.")
+        deadline = time.monotonic() + run_state.timeout_seconds
+        while True:
+            if run_state.stop_requested.is_set():
+                _stop_gardener_process(process)
+                returncode = process.wait()
+                run_state.progress.put("[stopped]\nCached action stopped by user.")
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_gardener_process(process)
+                returncode = process.wait()
+                run_state.progress.put("[error]\nCached action timed out and was stopped.")
+                break
+            try:
+                returncode = process.wait(timeout=min(0.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
         stdout_reader.join()
         stderr_reader.join()
         run_state.stdout = "".join(stdout_lines).strip()
         run_state.stderr = "".join(stderr_lines).strip()
-        if returncode != 0:
+        if run_state.stop_requested.is_set():
+            run_state.result = GardenerResult(False, "stopped", "Cached action stopped by user.")
+        elif returncode != 0:
             run_state.result = GardenerResult(
                 robot=True,
                 status="error",
@@ -2896,7 +3050,23 @@ def _gardener_script_worker(run_state: GardenerScriptRunState) -> None:
     except BaseException as exc:
         run_state.error = exc
     finally:
+        run_state.process = None
         run_state.done = True
+
+
+def _stop_gardener_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+
+def stop_gardener_script_run(run_state: GardenerScriptRunState) -> None:
+    run_state.stop_requested.set()
+    if run_state.process is not None:
+        _stop_gardener_process(run_state.process)
 
 
 def resolve_gardener_target(
@@ -3074,12 +3244,16 @@ def render_gardener_scheduler(notebook_dir: Path, tools_dir: Path) -> None:
                 result="Could not start Robot script preparation.",
             )
     else:
-        start_gardener_script_run(task, project, note, script_path, tools_dir)
+        start_gardener_script_run(task, notebook_dir, project, note, script_path, tools_dir)
     st.rerun(scope="app")
 
 
 def _agent_worker(run_state: AgentRunState) -> None:
-    agent = default_agent(run_state.agent, timeout_seconds=run_state.agent_timeout_seconds)
+    agent = default_agent(
+        run_state.agent,
+        timeout_seconds=run_state.agent_timeout_seconds,
+        codex_model=run_state.codex_model,
+    )
     context = AgentContext(
         project_dir=run_state.project.path,
         project_name=run_state.project.name,
@@ -3185,16 +3359,18 @@ def finish_agent_run(run_state: AgentRunState) -> None:
         )
         if task is not None:
             if run_state.error is not None:
+                status = "stopped" if isinstance(run_state.error, AgentStopped) else "error"
+                summary = "Robot stopped by user." if status == "stopped" else str(run_state.error)
                 mark_gardener_finished(
                     notebook_dir,
                     task.id,
-                    status="error",
-                    result=str(run_state.error),
+                    status=status,
+                    result=summary,
                 )
-                record_gardener_result(task, status="error", summary=str(run_state.error))
+                record_gardener_result(task, status=status, summary=summary)
                 queue_gardener_notification(
-                    f"Gardener failed: {task.action_name}",
-                    icon=":material/error:",
+                    f"Gardener {'stopped' if status == 'stopped' else 'failed'}: {task.action_name}",
+                    icon=":material/stop_circle:" if status == "stopped" else ":material/error:",
                 )
             elif mode == "followup":
                 response = run_state.result.response if run_state.result is not None else "Completed."
@@ -3416,7 +3592,18 @@ def render_gardener_script_progress_panel() -> None:
     drain_gardener_progress(run_state)
     entries = st.session_state.get("gardener_progress_entries", [])
     with st.status(f"🌿 Gardener is running {run_state.task.action_name}...", expanded=True, state="running"):
-        st.caption("Running the cached action script")
+        stop_col, detail_col = st.columns([0.2, 0.8], vertical_alignment="center")
+        with stop_col:
+            if st.button(
+                "Stopping" if run_state.stop_requested.is_set() else "Stop",
+                key=f"stop_gardener_progress_{run_state.run_id}",
+                icon=":material/stop_circle:",
+                disabled=run_state.stop_requested.is_set(),
+            ):
+                stop_gardener_script_run(run_state)
+                st.rerun()
+        with detail_col:
+            st.caption("Running the cached action script")
         st.container(height=220, border=False).code(
             "\n\n".join(entries) if entries else "Waiting for cached action output...",
             language=None,
@@ -3432,6 +3619,49 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
     if isinstance(queued_prompt, str) and queued_prompt.strip():
         st.session_state[action_selector_key(note)] = None
         st.session_state[prompt_key] = queued_prompt
+
+    config = get_config()
+    selected_model = config.codex_model
+    model_error: str | None = None
+    try:
+        model_options = selectable_agent_models(config.agent, config.codex_model)
+    except AgentError as exc:
+        model_options = None
+        model_error = str(exc)
+
+    if model_options:
+        last_model = agent_model_preferences().get(config.agent) or st.session_state.get(
+            "last_agent_model"
+        )
+        default_model = last_model or config.codex_model
+        if default_model and default_model not in model_options:
+            model_options = [default_model, *model_options]
+        model_widget_key = f"agent_model_{config.agent}"
+        seeded_from_command_line = last_model is None and bool(config.codex_model)
+        if seeded_from_command_line:
+            # Persist the command-line choice even if Streamlit later discards the widget.
+            st.session_state.last_agent_model = config.codex_model
+            default_model = config.codex_model
+        if (
+            seeded_from_command_line
+            or model_widget_key not in st.session_state
+            or st.session_state[model_widget_key] not in model_options
+        ):
+            if default_model:
+                st.session_state[model_widget_key] = default_model
+            else:
+                st.session_state[model_widget_key] = model_options[0]
+        selected_model = st.selectbox(
+            "Model",
+            model_options,
+            key=model_widget_key,
+            on_change=remember_selected_agent_model,
+            args=(config.agent, model_widget_key),
+        )
+    elif model_error:
+        st.caption(f"Model selection is unavailable: {model_error}")
+    elif model_options is not None:
+        st.caption("Model selection is unavailable: Codex returned no models for this account.")
 
     action_input, prompt_input = st.columns([0.34, 0.66], vertical_alignment="top")
     with action_input:
@@ -3455,15 +3685,18 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
             else prompt.strip()
         )
         try:
-            config = get_config()
             start_agent_command(
                 project,
                 note,
                 agent_prompt,
                 tools_dir,
                 config.agent,
+                selected_model,
                 config.agent_timeout_seconds,
             )
+            st.session_state.last_agent_model = selected_model
+            if selected_model:
+                agent_model_preferences()[config.agent] = selected_model
             st.session_state.last_agent_error = None
         except (OSError, GitError, AgentError) as exc:
             st.session_state.last_agent_error = f"Could not start robot: {exc}"
@@ -3484,6 +3717,7 @@ def main() -> None:
         initialize_notebook(notebook_dir)
         ensure_tools_dir(tools_dir)
         ensure_tools_git_repo(tools_dir)
+        reset_gardener_tasks_at_startup(str(notebook_dir.resolve()))
         projects = list_projects(notebook_dir)
     except (OSError, GitError) as exc:
         st.error(f"Could not open workspace folders: {exc}")
@@ -3848,8 +4082,13 @@ def main() -> None:
                 st.session_state.last_agent_error = None
                 st.rerun()
     render_fast_action_completion(project, note)
-    render_gardener_completion()
-    render_agent_completion()
+    has_agent_completion = isinstance(st.session_state.get("last_gardener_result"), dict) or bool(
+        st.session_state.get("last_agent_response")
+    )
+    if has_agent_completion:
+        with st.container(key="agent_completion"):
+            render_gardener_completion()
+            render_agent_completion()
     render_gardener_notifications()
 
     if not is_history_view:
