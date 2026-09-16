@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from lightacademia.agents import (
     AgentContext,
@@ -10,6 +11,7 @@ from lightacademia.agents import (
     AgentStopped,
     ClaudeCliAgent,
     CodexCliAgent,
+    available_agent_models,
     create_agent,
     claude_progress_from_event,
     claude_tool_action_from_event,
@@ -19,6 +21,25 @@ from lightacademia.agents import (
 
 
 class CodexProgressTest(unittest.TestCase):
+    @patch("lightacademia.agents.shutil.which", return_value="/usr/local/bin/codex")
+    @patch("lightacademia.agents.subprocess.run")
+    def test_codex_lists_models_with_cli(self, run, _which) -> None:
+        run.return_value.returncode = 0
+        run.return_value.stdout = '{"models":[{"slug":"gpt-5-codex"},{"slug":"gpt-4.1"}]}'
+        run.return_value.stderr = ""
+
+        self.assertEqual(CodexCliAgent().available_models(), ["gpt-5-codex", "gpt-4.1"])
+        run.assert_called_once_with(
+            ["/usr/local/bin/codex", "debug", "models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_agents_without_model_capability_do_not_list_models(self) -> None:
+        self.assertIsNone(available_agent_models("claude"))
+
     def test_builds_prompt_from_external_template(self) -> None:
         agent = CodexCliAgent()
         context = AgentContext(
@@ -53,6 +74,22 @@ class CodexProgressTest(unittest.TestCase):
         )
 
         self.assertIn("sandbox_workspace_write.network_access=true", command)
+
+    def test_codex_command_selects_model(self) -> None:
+        agent = CodexCliAgent(model="gpt-5-codex")
+        context = AgentContext(
+            project_dir=Path("/project"),
+            project_name="project",
+            tools_dir=Path("/tools"),
+            current_note="Home.md",
+        )
+
+        command = agent._build_command(
+            "codex", context, Path("/temporary/tools"), Path("/temporary/last-message.md")
+        )
+
+        self.assertIn("--model", command)
+        self.assertIn("gpt-5-codex", command)
 
     def test_builds_runtime_tools_environment(self) -> None:
         agent = CodexCliAgent()

@@ -169,6 +169,37 @@ render_note_board(board, Path({str(project_dir)!r}), "Experiments.md", "test", 0
             self.assertEqual(list(app_test.exception), [])
             self.assertEqual(app_test.dataframe[0].value["Name"].tolist(), ["run-2"])
 
+    def test_renders_dataframe_annotation_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+            data_dir = project_dir / "data"
+            data_dir.mkdir()
+            csv_path = data_dir / "metrics.csv"
+            csv_path.write_text(
+                "run,cluster,score\nfirst,Fir,0.7\nsecond,Rorqual,0.9\n",
+                encoding="utf-8",
+            )
+            script = f'''\
+from pathlib import Path
+from app import render_project_dataframe
+from lightacademia.boards import BoardFilter
+
+render_project_dataframe(
+    Path({str(csv_path)!r}),
+    Path({str(project_dir)!r}),
+    filters=(BoardFilter("run", "text"), BoardFilter("cluster", "dropdown")),
+    dataframe_key="test",
+)
+'''
+
+            app_test = AppTest.from_string(script).run()
+
+            self.assertEqual(list(app_test.exception), [])
+            self.assertEqual(len(app_test.text_input), 1)
+            self.assertEqual(len(app_test.selectbox), 1)
+            app_test.text_input[0].input("second").run()
+            self.assertEqual(app_test.dataframe[0].value["run"].tolist(), ["second"])
+
     def test_matching_fast_fetch_script_runs_without_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)

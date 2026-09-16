@@ -300,6 +300,20 @@ body:has(.st-key-agent_panel details[open]) div:has(> iframe[title="code_editor.
     max-height: clamp(340px, calc(100dvh - 25rem), 1200px);
 }
 
+/* Completed-run feedback sits between the workspace and Robot chat. Keep it
+   bounded and reserve its space in both independently scrolling panes. */
+.st-key-agent_completion {
+    max-height: min(14rem, 28dvh);
+    overflow-y: auto;
+}
+
+body:has(.st-key-agent_completion) .st-key-preview_pane,
+body:has(.st-key-agent_completion) iframe[title="code_editor.code_editor"],
+body:has(.st-key-agent_completion) div:has(> iframe[title="code_editor.code_editor"]) {
+    height: clamp(240px, calc(100dvh - 39rem), 1200px) !important;
+    max-height: clamp(240px, calc(100dvh - 39rem), 1200px);
+}
+
 .st-key-preview_pane [data-testid="stMarkdownContainer"] {
     color: var(--la-ink);
     line-height: 1.6;

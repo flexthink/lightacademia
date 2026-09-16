@@ -26,4 +26,6 @@ Add both to this note.
 
 The preview keeps the description collapsed and shows a Run button above it. Selecting an action adds its instructions to the agent request; it does not execute automatically.
 
+To schedule an action, use the plant button beside its Run button in Preview. See [Gardener](Gardener.md) for cached scheduled actions and Robot follow-up.
+
 Return to [Getting Started](Home.md).

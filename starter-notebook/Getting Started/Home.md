@@ -21,6 +21,7 @@ Expand **Agent chat** at the bottom of the page, enter a request, and run the co
 Light Academia saves current edits before an agent run, shows live progress, reloads changed notes afterward, and records agent changes in Git with an `[agent]` prefix.
 
 See [Agent and Actions](Agent%20and%20Actions.md) for reusable actions and project guidance.
+Use [Gardener](Gardener.md) to schedule recurring actions with cached scripts and Robot follow-up when needed.
 Try the runnable [MNIST experiment board](Boards.md) for an example of agent-generated tabular data and local filters.
 
 ## Research Outputs
@@ -54,8 +55,14 @@ Display a CSV as an interactive, sortable table:
 ```dataframe
 columns:
   validation_accuracy: Validation Accuracy
+filters:
+- experiment
+- cluster: dropdown
 ```
 ````
+
+Dataframe filters are local: a bare column name creates a case-insensitive text
+filter, while `: dropdown` selects from the distinct values in that column.
 
 Create an agent-refreshed board with row actions:
 

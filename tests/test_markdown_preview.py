@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import quote
 
 from streamlit.testing.v1 import AppTest
 
@@ -20,9 +21,31 @@ from lightacademia.markdown_preview import (
     relativize_project_links,
     rewrite_project_note_links,
 )
+from app import format_dataframe_for_latex, format_dataframe_for_plain_text
+import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
+
+
+class DataframeCopyFormatTest(unittest.TestCase):
+    def test_formats_dataframe_for_markdown_and_latex_copying(self) -> None:
+        dataframe = pd.DataFrame(
+            {
+                "Experiment": ["baseline", "longer run"],
+                "Accuracy": [0.91, None],
+            }
+        )
+
+        markdown = format_dataframe_for_plain_text(dataframe)
+        latex = format_dataframe_for_latex(dataframe)
+
+        self.assertIn("| Experiment", markdown)
+        self.assertIn("| longer run", markdown)
+        self.assertNotIn("nan", markdown.casefold())
+        self.assertIn(r"\begin{tabular}", latex)
+        self.assertIn("Experiment", latex)
+        self.assertNotIn("nan", latex.casefold())
 
 
 class FindStandaloneImagesTest(unittest.TestCase):
@@ -90,7 +113,23 @@ class DataframeLinkTest(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].columns, {"foo_bar": "Foo Bar", "asr_dwer_micro": "dWER"})
+        self.assertEqual(result[0].filters, ())
         self.assertEqual((result[0].start_line, result[0].end_line), (0, 7))
+
+    def test_finds_dataframe_filters(self) -> None:
+        result = find_standalone_dataframes(
+            "[dataframe](data/metrics.csv)\n\n"
+            "```dataframe\n"
+            "filters:\n"
+            "- run\n"
+            "- cluster: dropdown\n"
+            "```\n"
+        )
+
+        self.assertEqual(
+            [(item.column, item.filter_type) for item in result[0].filters],
+            [("run", "text"), ("cluster", "dropdown")],
+        )
 
     def test_reports_invalid_dataframe_annotations(self) -> None:
         result = find_standalone_dataframes("[dataframe](data/metrics.csv)\n\n```dataframe\ncolumns: nope\n```\n")
@@ -213,6 +252,23 @@ class RewriteProjectNoteLinksTest(unittest.TestCase):
             self.assertEqual(errors, ())
             self.assertIn("[Results](#/project/", markdown)
             self.assertIn("/note/Results.md)", markdown)
+
+    def test_rewrites_localhost_editor_note_link_to_hash_route(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            note = project_root / "Continuous Ablation.md"
+            note.write_text("# Continuous Ablation\n", encoding="utf-8")
+            editor_url = f"http://127.0.0.1:8599{quote(str(note))}:710"
+
+            markdown, errors = rewrite_project_note_links(
+                f"[Open note]({editor_url})\n",
+                project_root,
+            )
+
+            self.assertEqual(errors, ())
+            self.assertNotIn("127.0.0.1", markdown)
+            self.assertIn("[Open note](#/project/", markdown)
+            self.assertIn("/note/Continuous%20Ablation.md)", markdown)
 
 
 class ProjectFileLinksTest(unittest.TestCase):

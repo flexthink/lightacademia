@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any, Protocol
+from typing import IO, Any, Protocol, runtime_checkable
 
 
 class AgentError(RuntimeError):
@@ -64,8 +64,19 @@ class Agent(Protocol):
         pass
 
 
+@runtime_checkable
+class ModelSelectableAgent(Protocol):
+    """Optional capability for agents whose runnable models can be selected in the UI."""
+
+    supports_model_selection: bool
+
+    def available_models(self) -> list[str]:
+        pass
+
+
 class CodexCliAgent:
     name = "Codex CLI"
+    supports_model_selection = True
 
     def __init__(
         self,
@@ -74,12 +85,51 @@ class CodexCliAgent:
         network_access: bool = True,
         timeout_seconds: int = 900,
         prompt_template: Path | None = None,
+        model: str | None = None,
     ) -> None:
         self.executable = executable
         self.sandbox = sandbox
         self.network_access = network_access
         self.timeout_seconds = timeout_seconds
         self.prompt_template = prompt_template or DEFAULT_PROMPT_TEMPLATE
+        self.model = model.strip() if model and model.strip() else None
+
+    def available_models(self) -> list[str]:
+        """Return models available to the authenticated Codex CLI session."""
+        executable = shutil.which(self.executable)
+        if executable is None:
+            raise AgentError(f"Could not find `{self.executable}` on PATH.")
+        try:
+            result = subprocess.run(
+                [executable, "debug", "models"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except OSError as exc:
+            raise AgentError(f"Could not run `{self.executable} debug models`: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise AgentError("`codex debug models` timed out after 30 seconds.") from exc
+
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "Codex CLI failed."
+            raise AgentError(f"Could not list Codex models: {detail}")
+        try:
+            payload = json.loads(result.stdout)
+            models = payload.get("models") if isinstance(payload, dict) else None
+            if not isinstance(models, list):
+                raise ValueError("missing `models` list")
+            model_names: list[str] = []
+            for model in models:
+                if not isinstance(model, dict) or not isinstance(model.get("slug"), str):
+                    continue
+                model_name = model["slug"].strip()
+                if model_name and model_name not in model_names:
+                    model_names.append(model_name)
+            return model_names
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise AgentError(f"Could not parse `codex debug models` output: {exc}") from exc
 
     def run(
         self,
@@ -133,6 +183,8 @@ class CodexCliAgent:
             "--sandbox",
             self.sandbox,
         ]
+        if self.model:
+            command.extend(["--model", self.model])
         if self.sandbox == "workspace-write":
             command.extend(
                 [
@@ -325,6 +377,7 @@ class CodexCliAgent:
 
 class ClaudeCliAgent(CodexCliAgent):
     name = "Claude CLI"
+    supports_model_selection = False
 
     def __init__(
         self,
@@ -533,17 +586,37 @@ class ClaudeCliAgent(CodexCliAgent):
         }
 
 
-def create_agent(kind: str, timeout_seconds: int = 3600) -> Agent:
+def create_agent(
+    kind: str,
+    timeout_seconds: int = 3600,
+    codex_model: str | None = None,
+) -> Agent:
     normalized = kind.strip().lower()
     if normalized == "codex":
-        return CodexCliAgent(timeout_seconds=timeout_seconds)
+        return CodexCliAgent(timeout_seconds=timeout_seconds, model=codex_model)
     if normalized in {"claude", "claude-code", "claude_code"}:
         return ClaudeCliAgent(timeout_seconds=timeout_seconds)
     raise AgentError(f"Unknown agent: {kind}. Expected one of: codex, claude.")
 
 
-def default_agent(kind: str = "codex", timeout_seconds: int = 3600) -> Agent:
-    return create_agent(kind, timeout_seconds=timeout_seconds)
+def default_agent(
+    kind: str = "codex",
+    timeout_seconds: int = 3600,
+    codex_model: str | None = None,
+) -> Agent:
+    return create_agent(kind, timeout_seconds=timeout_seconds, codex_model=codex_model)
+
+
+def available_agent_models(
+    kind: str,
+    *,
+    codex_model: str | None = None,
+) -> list[str] | None:
+    """Return selectable models when an agent implements that optional capability."""
+    agent = create_agent(kind, codex_model=codex_model)
+    if not isinstance(agent, ModelSelectableAgent) or not agent.supports_model_selection:
+        return None
+    return agent.available_models()
 
 
 def event_text(value: Any) -> str:

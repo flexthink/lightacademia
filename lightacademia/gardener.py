@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import signal
+import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +32,7 @@ class GardenerTask:
     last_status: str | None = None
     last_result: str | None = None
     action_line: int = 0
+    active_pid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,7 @@ def load_gardener_tasks(notebook_dir: Path) -> list[GardenerTask]:
                 last_status=_optional_string(raw_task.get("last_status")),
                 last_result=_optional_string(raw_task.get("last_result")),
                 action_line=max(0, int(raw_task.get("action_line", 0))),
+                active_pid=_optional_positive_int(raw_task.get("active_pid")),
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -162,6 +167,29 @@ def request_gardener_run(notebook_dir: Path, task_ids: set[str]) -> None:
     save_gardener_tasks(notebook_dir, updated)
 
 
+def reset_interrupted_gardener_tasks(notebook_dir: Path) -> int:
+    """Make tasks left running by a previous app process runnable again."""
+    reset_count = 0
+    updated = []
+    for task in load_gardener_tasks(notebook_dir):
+        if task.last_status in {"busy", "running"}:
+            _stop_tracked_gardener_process(task.active_pid, gardener_script_path(task))
+            task = GardenerTask(
+                **{
+                    **asdict(task),
+                    "last_started_at": None,
+                    "last_status": "ready",
+                    "last_result": "Reset after Light Academia restarted.",
+                    "active_pid": None,
+                }
+            )
+            reset_count += 1
+        updated.append(task)
+    if reset_count:
+        save_gardener_tasks(notebook_dir, updated)
+    return reset_count
+
+
 def due_gardener_tasks(notebook_dir: Path, now: datetime | None = None) -> list[GardenerTask]:
     current_time = now or datetime.now(timezone.utc)
     due = []
@@ -174,7 +202,11 @@ def due_gardener_tasks(notebook_dir: Path, now: datetime | None = None) -> list[
 
 def mark_gardener_started(notebook_dir: Path, task_id: str, now: datetime | None = None) -> None:
     timestamp = (now or datetime.now(timezone.utc)).isoformat()
-    _replace_task(notebook_dir, task_id, last_started_at=timestamp, last_status="running", last_result=None)
+    _replace_task(notebook_dir, task_id, last_started_at=timestamp, last_status="running", last_result=None, active_pid=None)
+
+
+def mark_gardener_process_started(notebook_dir: Path, task_id: str, process_id: int) -> None:
+    _replace_task(notebook_dir, task_id, active_pid=process_id)
 
 
 def mark_gardener_finished(
@@ -192,6 +224,7 @@ def mark_gardener_finished(
         last_run_at=timestamp,
         last_status=status,
         last_result=_short_result(result),
+        active_pid=None,
     )
 
 
@@ -315,7 +348,7 @@ def parse_gardener_result(stdout: str) -> GardenerResult:
     return GardenerResult(robot, status.strip(), summary.strip(), payload.get("details"))
 
 
-def _replace_task(notebook_dir: Path, task_id: str, **changes: str | None) -> None:
+def _replace_task(notebook_dir: Path, task_id: str, **changes: object) -> None:
     updated = []
     for task in load_gardener_tasks(notebook_dir):
         if task.id == task_id:
@@ -326,6 +359,35 @@ def _replace_task(notebook_dir: Path, task_id: str, **changes: str | None) -> No
 
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _optional_positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _stop_tracked_gardener_process(process_id: int | None, expected_script: str) -> None:
+    """Terminate only a verified, dedicated Gardener process group."""
+    if process_id is None:
+        return
+    try:
+        command = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(process_id)],
+            capture_output=True,
+            check=False,
+            text=True,
+        ).stdout.strip()
+        if (
+            command
+            and expected_script in command
+            and os.getpgid(process_id) == process_id
+        ):
+            os.killpg(process_id, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
