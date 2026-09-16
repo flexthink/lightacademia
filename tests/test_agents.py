@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from lightacademia.agents import (
     AgentContext,
+    AgentError,
     AgentProgress,
     AgentStopped,
     ClaudeCliAgent,
@@ -23,6 +24,13 @@ from lightacademia.agents import (
 
 
 class CodexProgressTest(unittest.TestCase):
+    @patch("lightacademia.agents.Codex", None)
+    def test_codex_dependency_is_optional_until_agent_is_used(self) -> None:
+        agent = CodexSdkAgent()
+
+        with self.assertRaisesRegex(AgentError, "requirements-codex.txt"):
+            agent.available_models()
+
     @patch("lightacademia.agents.Codex")
     def test_codex_lists_models_with_sdk(self, codex_class) -> None:
         codex = codex_class.return_value.__enter__.return_value

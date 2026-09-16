@@ -11,11 +11,21 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, IO, Any, Protocol, runtime_checkable
 
-from openai_codex import Codex, CodexConfig, Sandbox
-from openai_codex.errors import CodexError
-from openai_codex.models import Notification
+if TYPE_CHECKING:
+    from openai_codex.models import Notification
+
+try:
+    from openai_codex import Codex, CodexConfig, Sandbox
+    from openai_codex.errors import CodexError
+except ImportError:
+    Codex = None  # type: ignore[assignment]
+    CodexConfig = None  # type: ignore[assignment]
+    Sandbox = None  # type: ignore[assignment]
+
+    class CodexError(Exception):
+        """Fallback used so non-Codex agents work without the optional SDK."""
 
 
 class AgentError(RuntimeError):
@@ -146,6 +156,8 @@ class CodexSdkAgent(AgentSupport):
 
     def available_models(self) -> list[str]:
         """Return models available to the authenticated Codex SDK session."""
+        if Codex is None:
+            raise _missing_codex_sdk_error()
         try:
             with Codex() as codex:
                 return [model.model for model in codex.models().data]
@@ -159,6 +171,8 @@ class CodexSdkAgent(AgentSupport):
         on_progress: ProgressCallback | None = None,
         should_stop: StopCallback | None = None,
     ) -> AgentResult:
+        if Codex is None or CodexConfig is None or Sandbox is None:
+            raise _missing_codex_sdk_error()
         temporary = tempfile.TemporaryDirectory(prefix="lightacademia-codex-")
         tools_workspace = Path(temporary.name) / "tools"
         self._copy_tools_dir(context.tools_dir, tools_workspace)
@@ -478,7 +492,14 @@ def available_agent_models(
     return agent.available_models()
 
 
-def codex_event_from_notification(notification: Notification) -> dict[str, Any]:
+def _missing_codex_sdk_error() -> AgentError:
+    return AgentError(
+        "The Codex agent requires the optional `openai-codex` package. "
+        "Install it with `pip install -r requirements-codex.txt`."
+    )
+
+
+def codex_event_from_notification(notification: "Notification") -> dict[str, Any]:
     """Translate typed SDK notifications into the UI's stable event shape."""
     event_type = notification.method.replace("/", ".")
     payload = notification.payload

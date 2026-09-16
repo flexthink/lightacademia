@@ -156,6 +156,13 @@ python -m streamlit run app.py -- --agent codex
 python -m streamlit run app.py -- --agent claude
 ```
 
+Codex support is optional. Install the Codex-enabled dependency set before
+starting the app with `--agent codex`:
+
+```bash
+pip install -r requirements-codex.txt
+```
+
 When using Codex, select a specific model with `--codex-model`; omit it to use
 the model selected by the Codex SDK runtime:
 
