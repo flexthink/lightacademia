@@ -35,12 +35,24 @@ class CodexProgressTest(unittest.TestCase):
     def test_codex_lists_models_with_sdk(self, codex_class) -> None:
         codex = codex_class.return_value.__enter__.return_value
         codex.models.return_value.data = [
-            SimpleNamespace(model="gpt-5-codex"),
-            SimpleNamespace(model="gpt-4.1"),
+            SimpleNamespace(model="gpt-5-codex", is_default=False),
+            SimpleNamespace(model="gpt-4.1", is_default=True),
         ]
 
-        self.assertEqual(CodexSdkAgent().available_models(), ["gpt-5-codex", "gpt-4.1"])
+        self.assertEqual(
+            CodexSdkAgent().available_models(),
+            ["gpt-4.1", "gpt-5-codex", "gpt-reserve"],
+        )
         codex.models.assert_called_once_with()
+
+    @patch("lightacademia.agents.Codex")
+    def test_codex_does_not_duplicate_gpt_reserve(self, codex_class) -> None:
+        codex = codex_class.return_value.__enter__.return_value
+        codex.models.return_value.data = [
+            SimpleNamespace(model="gpt-reserve", is_default=True),
+        ]
+
+        self.assertEqual(CodexSdkAgent().available_models(), ["gpt-reserve"])
 
     def test_agents_without_model_capability_do_not_list_models(self) -> None:
         self.assertIsNone(available_agent_models("claude"))
@@ -59,6 +71,9 @@ class CodexProgressTest(unittest.TestCase):
         self.assertIn("Project: Research", prompt)
         self.assertIn("Current note: Results.md", prompt)
         self.assertIn("User request:\nSummarize the results.", prompt)
+        self.assertIn("The visible link label must be exactly `dataframe`", prompt)
+        self.assertIn("`[status report](data/status.csv)` is only a downloadable file link", prompt)
+        self.assertIn("update the selected note with that exact standalone `[dataframe](...)` construct", prompt)
         self.assertNotIn("{{project_name}}", prompt)
         self.assertNotIn("{{user_prompt}}", prompt)
 

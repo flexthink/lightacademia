@@ -200,6 +200,37 @@ render_project_dataframe(
             app_test.text_input[0].input("second").run()
             self.assertEqual(app_test.dataframe[0].value["run"].tolist(), ["second"])
 
+    def test_renders_same_dataframe_twice_with_distinct_copy_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+            csv_path = project_dir / "metrics.csv"
+            csv_path.write_text("run,score\nfirst,0.7\n", encoding="utf-8")
+            script = f'''\
+from pathlib import Path
+import app
+
+seen_keys = set()
+def copy_table_buttons(**kwargs):
+    key = kwargs["key"]
+    if key in seen_keys:
+        raise AssertionError(f"duplicate component key: {{key}}")
+    seen_keys.add(key)
+
+app.copy_table_buttons_component = lambda: copy_table_buttons
+
+for dataframe_key in ("first-occurrence", "second-occurrence"):
+    app.render_project_dataframe(
+        Path({str(csv_path)!r}),
+        Path({str(project_dir)!r}),
+        dataframe_key=dataframe_key,
+    )
+'''
+
+            app_test = AppTest.from_string(script).run()
+
+            self.assertEqual(list(app_test.exception), [])
+            self.assertEqual(len(app_test.dataframe), 2)
+
     def test_matching_fast_fetch_script_runs_without_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)

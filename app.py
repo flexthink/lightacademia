@@ -36,6 +36,8 @@ from streamlit.components.v2.get_bidi_component_manager import get_bidi_componen
 from streamlit.components.v2.manifest_scanner import ComponentConfig, ComponentManifest
 from streamlit_extras.resizable_columns import resizable_columns
 
+from lightacademia.agent_progress import finish_activities, reduce_progress
+from lightacademia.agent_ui import render_agent_activities, render_agent_transcript
 from lightacademia.actions import NoteAction, build_action_prompt, format_note_action, parse_note_actions
 from lightacademia.agents import (
     AgentContext,
@@ -43,6 +45,7 @@ from lightacademia.agents import (
     AgentProgress,
     AgentResult,
     AgentStopped,
+    ChatCapableAgent,
     available_agent_models,
     default_agent,
 )
@@ -147,6 +150,7 @@ except Exception:  # pragma: no cover - optional Streamlit component
 DEFAULT_NOTEBOOK_DIR = Path("notebook")
 DEFAULT_TOOLS_DIR = Path("tools")
 DEFAULT_AUTOCOMMIT_SECONDS = 5 * 60
+DEFAULT_CODEX_MODEL = "gpt-reserve"
 NOTE_PANE_HEIGHT = 430
 ICON_BUTTON_LABEL = ""
 LOGO_PATH = Path("assets/logo.png")
@@ -515,8 +519,11 @@ class AgentRunState:
     before_status: set[str]
     progress: queue.Queue[AgentProgress]
     stop_requested: threading.Event
+    mode: str = "action"
+    chat_key: str | None = None
+    chat_details: dict[str, object] = field(default_factory=dict)
     thread: threading.Thread | None = None
-    result: AgentResult | None = None
+    result: AgentResult | AgentChatResult | None = None
     response_message: str | None = None
     error: BaseException | None = None
     done: bool = False
@@ -566,10 +573,15 @@ def reset_gardener_tasks_at_startup(notebook_dir: str) -> int:
     return reset_interrupted_gardener_tasks(Path(notebook_dir))
 
 
-@st.cache_resource
 def agent_model_preferences() -> dict[str, str]:
-    """Keep model choices across browser refreshes for this app process."""
-    return {}
+    """Keep explicit model choices within the current Streamlit session."""
+    return st.session_state.setdefault("agent_model_preferences", {})
+
+
+def preferred_agent_model(agent: str, configured_model: str | None) -> str | None:
+    return agent_model_preferences().get(agent) or configured_model or (
+        DEFAULT_CODEX_MODEL if agent == "codex" else None
+    )
 
 
 @lru_cache(maxsize=1)
@@ -579,7 +591,7 @@ def get_config() -> AppConfig:
     parser.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--autocommit-seconds", type=int, default=DEFAULT_AUTOCOMMIT_SECONDS)
     parser.add_argument("--agent", choices=("codex", "claude"), default="codex")
-    parser.add_argument("--codex-model", default=None, help="Model passed to the Codex SDK.")
+    parser.add_argument("--codex-model", default=DEFAULT_CODEX_MODEL, help="Model passed to the Codex SDK.")
     parser.add_argument("--agent-timeout-seconds", type=int, default=3600)
     args, _ = parser.parse_known_args()
     return AppConfig(
@@ -601,7 +613,6 @@ def selectable_agent_models(agent: str, codex_model: str | None) -> list[str] | 
 def remember_selected_agent_model(agent: str, widget_key: str) -> None:
     selected_model = st.session_state.get(widget_key)
     if isinstance(selected_model, str) and selected_model:
-        st.session_state.last_agent_model = selected_model
         agent_model_preferences()[agent] = selected_model
 
 
@@ -1159,13 +1170,14 @@ def init_state() -> None:
         "agent_running": False,
         "active_agent_run_id": None,
         "agent_progress_entries": [],
-        "agent_progress_chars": 0,
         "requested_action": None,
         "queued_agent_prompt": None,
         "board_action_needs_app_rerun": False,
         "pending_fast_board_action": None,
         "agent_chat_revision": 0,
-        "last_agent_model": None,
+        "agent_model_preferences": {},
+        "agent_chats": {},
+        "pending_robot_action_reset": None,
         "source_visible": False,
         "editor_cursors": {},
         "history_revision": None,
@@ -1724,10 +1736,11 @@ def render_tool_code_editor(path: Path) -> str:
             content,
             lang=tool_file_language(path),
             theme="streamlit_light",
-            height=[34, 34],
+            # Match the CSS-sized iframe; line limits make Ace clip its scroll range.
+            height="100vh",
             key=key,
             response_mode=["debounce", "blur"],
-            options={"wrap": True, "fontSize": 14, "scrollPastEnd": 0.5},
+            options={"wrap": True, "fontSize": 14, "scrollPastEnd": 0.5, "useResizeObserver": True},
             props={"scrollMargin": [15, 160, 0, 0]},
             component_props={"css": EDITOR_COMPONENT_CSS},
         )
@@ -1795,10 +1808,11 @@ def render_editor(note) -> str:
             content,
             lang="markdown",
             theme="streamlit_light",
-            height=[34, 34],
+            # Match the CSS-sized iframe; line limits make Ace clip its scroll range.
+            height="100vh",
             key=key,
             response_mode=["debounce", "blur"],
-            options={"wrap": True, "fontSize": 14, "scrollPastEnd": 0.5},
+            options={"wrap": True, "fontSize": 14, "scrollPastEnd": 0.5, "useResizeObserver": True},
             props={"scrollMargin": [15, 160, 0, 0]},
             component_props={"css": EDITOR_COMPONENT_CSS},
         )
@@ -2195,7 +2209,7 @@ def render_project_dataframe(
         st.warning(annotation_error)
     st.caption(str(relative_path))
     copy_key = hashlib.sha256(
-        f"dataframe:{dataframe_path.resolve()}:{dataframe.to_csv(index=False)}".encode("utf-8")
+        f"dataframe:{dataframe_key}:{dataframe_path.resolve()}:{dataframe.to_csv(index=False)}".encode("utf-8")
     ).hexdigest()[:16]
     copy_table_buttons_component()(
         data={
@@ -2730,13 +2744,19 @@ def action_selector_key(note) -> str:
     return f"selected_action_{note.name}_{st.session_state.editor_revision}"
 
 
+def action_popover_key(note) -> str:
+    return f"robot_actions_{note.name}_{st.session_state.editor_revision}"
+
+
 def apply_requested_action(note, actions: tuple[NoteAction, ...]) -> None:
     requested_action = st.session_state.get("requested_action")
     if requested_action is None:
         return
     selected_action = next((action for action in actions if action == requested_action), None)
     if selected_action is not None:
+        st.session_state.pending_robot_action_reset = None
         st.session_state[action_selector_key(note)] = selected_action
+        st.session_state[action_popover_key(note)] = True
     st.session_state.requested_action = None
 
 
@@ -2764,10 +2784,15 @@ def start_agent_command(
     agent: str,
     codex_model: str | None,
     agent_timeout_seconds: int,
+    *,
+    mode: str = "action",
+    chat_key: str | None = None,
+    chat_details: dict[str, object] | None = None,
 ) -> AgentRunState:
-    save_editor_state(note)
-    git_commit_all(project.path, "Checkpoint before agent command")
-    st.session_state.last_commit_at = time.time()
+    if mode == "action":
+        save_editor_state(note)
+        git_commit_all(project.path, "Checkpoint before agent command")
+        st.session_state.last_commit_at = time.time()
 
     run_id = uuid.uuid4().hex
     run_state = AgentRunState(
@@ -2779,6 +2804,9 @@ def start_agent_command(
         agent=agent,
         codex_model=codex_model,
         agent_timeout_seconds=agent_timeout_seconds,
+        mode=mode,
+        chat_key=chat_key,
+        chat_details=dict(chat_details or {}),
         before_status=set(git_status_lines(project.path)),
         progress=queue.Queue(),
         stop_requested=threading.Event(),
@@ -2792,9 +2820,9 @@ def start_agent_command(
     agent_runs()[run_id] = run_state
     st.session_state.active_agent_run_id = run_id
     st.session_state.agent_running = True
-    st.session_state.last_agent_response = None
+    if mode == "action":
+        st.session_state.last_agent_response = None
     st.session_state.agent_progress_entries = []
-    st.session_state.agent_progress_chars = 0
     logger.info("Starting agent run %s for project=%s note=%s", run_id, project.name, run_state.note_name)
     run_state.thread.start()
     return run_state
@@ -2823,7 +2851,7 @@ def start_board_agent_command(
             prompt.strip(),
             config.tools_dir,
             config.agent,
-            config.codex_model,
+            preferred_agent_model(config.agent, config.codex_model),
             config.agent_timeout_seconds,
         )
         st.session_state.last_agent_error = None
@@ -2853,7 +2881,7 @@ def start_gardener_agent(
             prompt,
             config.tools_dir,
             config.agent,
-            config.codex_model,
+            preferred_agent_model(config.agent, config.codex_model),
             config.agent_timeout_seconds,
         )
     except (OSError, GitError, AgentError):
@@ -3261,9 +3289,21 @@ def _agent_worker(run_state: AgentRunState) -> None:
         current_note=run_state.note_name or None,
     )
     try:
+        if run_state.mode == "chat":
+            if not isinstance(agent, ChatCapableAgent) or not agent.supports_chat:
+                raise AgentError(f"{agent.name} does not support chat mode.")
+            result = agent.chat(
+                run_state.prompt, context, details=run_state.chat_details,
+                on_progress=lambda progress: record_agent_progress(run_state, progress),
+                should_stop=run_state.stop_requested.is_set,
+            )
+            run_state.result = result  # type: ignore[assignment]
+            run_state.response_message = result.response
+            run_state.chat_details = result.details
+            logger.info("Agent chat turn %s finished successfully", run_state.run_id)
+            return
         result = agent.run(
-            run_state.prompt,
-            context,
+            run_state.prompt, context,
             on_progress=lambda progress: record_agent_progress(run_state, progress),
             should_stop=run_state.stop_requested.is_set,
         )
@@ -3301,8 +3341,8 @@ def normalize_project_markdown_links(project: Project) -> None:
 
 
 def record_agent_progress(run_state: AgentRunState, progress: AgentProgress) -> None:
-    entry = f"[{progress.event_type}]\n{progress.text}"
-    logger.info("Agent progress:\n%s", entry)
+    if progress.activity is None or not progress.activity.append:
+        logger.info("Agent progress [%s]:\n%s", progress.event_type, progress.text)
     run_state.progress.put(progress)
 
 
@@ -3318,31 +3358,44 @@ def active_agent_run() -> AgentRunState | None:
 
 
 def drain_agent_progress(run_state: AgentRunState) -> None:
-    entries = st.session_state.setdefault("agent_progress_entries", [])
-    progress_chars = int(st.session_state.get("agent_progress_chars") or 0)
+    activities = st.session_state.setdefault("agent_progress_entries", [])
     while True:
         try:
             progress = run_state.progress.get_nowait()
         except queue.Empty:
             break
-        entry = f"[{progress.event_type}]\n{progress.text}"
-        entries.append(entry)
-        progress_chars += len(entry)
-        while progress_chars > 100_000 and len(entries) > 1:
-            progress_chars -= len(entries.pop(0))
-    st.session_state.agent_progress_chars = progress_chars
+        activities = reduce_progress(activities, progress)
+    st.session_state.agent_progress_entries = activities
 
 
 def finish_agent_run(run_state: AgentRunState) -> None:
     drain_agent_progress(run_state)
+    activities = finish_activities(
+        st.session_state.get("agent_progress_entries", []),
+        "error" if run_state.error is not None else "complete",
+    )
+    st.session_state.agent_progress_entries = activities
     st.session_state.agent_running = False
     st.session_state.active_agent_run_id = None
     agent_runs().pop(run_state.run_id, None)
 
+    if run_state.mode == "chat":
+        chats = st.session_state.setdefault("agent_chats", {})
+        transcript = chats.setdefault(run_state.chat_key, {"messages": [], "details": {}})
+        response = run_state.response_message or ""
+        if isinstance(run_state.error, AgentStopped):
+            response = "Robot stopped."
+        elif run_state.error is not None:
+            response = f"Could not run robot: {run_state.error}"
+        transcript["messages"].append({"role": "assistant", "content": response, "activities": activities})
+        if run_state.error is None:
+            transcript["details"] = run_state.chat_details
+
     if run_state.error is None:
-        st.session_state.last_agent_response = run_state.response_message
+        if run_state.mode != "chat":
+            st.session_state.last_agent_response = run_state.response_message
+            st.session_state.last_commit_at = time.time()
         st.session_state.last_agent_error = None
-        st.session_state.last_commit_at = time.time()
     elif isinstance(run_state.error, AgentStopped):
         st.session_state.last_agent_error = "Robot stopped."
     else:
@@ -3562,23 +3615,23 @@ def render_agent_progress_panel() -> None:
     if run_state is None:
         return
     drain_agent_progress(run_state)
-    entries = st.session_state.get("agent_progress_entries", [])
-    status_label = "Stopping 🤖 Robot..." if run_state.stop_requested.is_set() else "🤖 Robot is working..."
-    with st.status(status_label, expanded=True, state="running"):
-        stop_col, _ = st.columns([0.2, 0.8])
-        with stop_col:
-            if st.button(
-                "Stop",
-                key=f"stop_agent_{run_state.run_id}",
-                icon=":material/stop_circle:",
-                disabled=run_state.stop_requested.is_set(),
-            ):
-                run_state.stop_requested.set()
-                st.rerun()
-        st.container(height=220, border=False).code(
-            "\n\n".join(entries) if entries else "Waiting for 🤖 Robot output...",
-            language=None,
-        )
+    activities = st.session_state.get("agent_progress_entries", [])
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.caption("Stopping Robot…" if run_state.stop_requested.is_set() else "Robot is working…")
+        if st.button(
+            "Stop", key=f"stop_agent_{run_state.run_id}",
+            icon=":material/stop_circle:", disabled=run_state.stop_requested.is_set(),
+        ):
+            run_state.stop_requested.set()
+            st.rerun()
+    with st.container(height=280, border=False, autoscroll=True):
+        if run_state.chat_key:
+            transcript = st.session_state.get("agent_chats", {}).get(run_state.chat_key, {})
+            render_agent_transcript(transcript.get("messages", []))
+        render_agent_activities(activities)
+        if not activities:
+            with st.chat_message("assistant", avatar=":material/settings:"):
+                st.caption("Waiting for Robot activity…")
     if run_state.done:
         finish_agent_run(run_state)
         st.rerun(scope="app")
@@ -3613,6 +3666,36 @@ def render_gardener_script_progress_panel() -> None:
         st.rerun(scope="app")
 
 
+def render_agent_model_selector(agent: str, configured_model: str | None) -> str | None:
+    selected_model = preferred_agent_model(agent, configured_model)
+    model_error: str | None = None
+    try:
+        model_options = selectable_agent_models(agent, configured_model)
+    except AgentError as exc:
+        model_options = None
+        model_error = str(exc)
+
+    if model_options:
+        model_options = list(model_options)
+        if selected_model and selected_model not in model_options:
+            # Account model discovery can omit aliases or a previous selection.
+            model_options.append(selected_model)
+        selected_model = st.selectbox(
+            "Model",
+            model_options,
+            index=model_options.index(selected_model) if selected_model else 0,
+            key=f"agent_model_{agent}",
+            on_change=remember_selected_agent_model,
+            args=(agent, f"agent_model_{agent}"),
+            persist_state="session",
+        )
+    elif model_error:
+        st.caption(f"Model selection is unavailable: {model_error}")
+    elif model_options is not None:
+        st.caption("Model selection is unavailable: Codex returned no models for this account.")
+    return selected_model
+
+
 def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], tools_dir: Path) -> None:
     prompt_key = f"agent_prompt_{note.name}_{st.session_state.editor_revision}"
     queued_prompt = st.session_state.pop("queued_agent_prompt", None)
@@ -3621,63 +3704,125 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
         st.session_state[prompt_key] = queued_prompt
 
     config = get_config()
-    selected_model = config.codex_model
-    model_error: str | None = None
-    try:
-        model_options = selectable_agent_models(config.agent, config.codex_model)
-    except AgentError as exc:
-        model_options = None
-        model_error = str(exc)
-
-    if model_options:
-        last_model = agent_model_preferences().get(config.agent) or st.session_state.get(
-            "last_agent_model"
-        )
-        default_model = last_model or config.codex_model
-        if default_model and default_model not in model_options:
-            model_options = [default_model, *model_options]
-        model_widget_key = f"agent_model_{config.agent}"
-        seeded_from_command_line = last_model is None and bool(config.codex_model)
-        if seeded_from_command_line:
-            # Persist the command-line choice even if Streamlit later discards the widget.
-            st.session_state.last_agent_model = config.codex_model
-            default_model = config.codex_model
-        if (
-            seeded_from_command_line
-            or model_widget_key not in st.session_state
-            or st.session_state[model_widget_key] not in model_options
-        ):
-            if default_model:
-                st.session_state[model_widget_key] = default_model
-            else:
-                st.session_state[model_widget_key] = model_options[0]
-        selected_model = st.selectbox(
-            "Model",
-            model_options,
-            key=model_widget_key,
-            on_change=remember_selected_agent_model,
-            args=(config.agent, model_widget_key),
-        )
-    elif model_error:
-        st.caption(f"Model selection is unavailable: {model_error}")
-    elif model_options is not None:
-        st.caption("Model selection is unavailable: Codex returned no models for this account.")
-
-    action_input, prompt_input = st.columns([0.34, 0.66], vertical_alignment="top")
-    with action_input:
-        selected_action = st.selectbox(
-            "Action",
-            [None, *actions],
-            format_func=action_option_label,
-            key=action_selector_key(note),
-            label_visibility="collapsed",
-        )
-    with prompt_input:
-        prompt = st.text_area("Message", height=120, key=prompt_key, label_visibility="collapsed")
-    submitted = st.button(
-        "Run robot",
-        key=f"run_agent_{note.name}_{st.session_state.editor_revision}",
+    capability_agent = default_agent(
+        config.agent, timeout_seconds=config.agent_timeout_seconds, codex_model=config.codex_model
     )
+    supports_chat = isinstance(capability_agent, ChatCapableAgent) and capability_agent.supports_chat
+    selector_key = action_selector_key(note)
+    popover_key = action_popover_key(note)
+    reset = st.session_state.pop("pending_robot_action_reset", None)
+    if isinstance(reset, dict):
+        st.session_state[reset["selector_key"]] = None
+        st.session_state[reset["popover_key"]] = False
+
+    # Render controls first so their values determine what the composer sends.
+    history_area = st.empty()
+    selected_action = None
+    run_action = False
+    with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key="robot_composer"):
+        input_area = st.container(width="stretch")
+        if supports_chat:
+            current_action = st.session_state.get(selector_key)
+            with st.popover(
+                current_action.name if current_action in actions else "Actions",
+                icon=":material/bolt:",
+                help="Choose a note action" if actions else "This note has no actions",
+                disabled=not actions,
+                key=popover_key,
+                on_change="rerun",
+            ):
+                if actions:
+                    selected_action = st.selectbox(
+                        "Action", [None, *actions],
+                        format_func=action_option_label,
+                        key=selector_key,
+                        persist_state="session",
+                    )
+                    st.caption("Send a message with extra instructions, or run the action directly.")
+                    run_action = st.button(
+                        "Run action", key=f"run_chat_action_{note.name}_{st.session_state.editor_revision}",
+                        icon=":material/bolt:", disabled=selected_action is None,
+                    )
+        with st.popover(
+            "Settings",
+            icon=":material/settings:",
+            help="Robot model",
+            key="robot_settings",
+        ):
+            selected_model = render_agent_model_selector(config.agent, config.codex_model)
+
+    if supports_chat:
+        chat_key = f"{project.path.resolve()}::{note.name}"
+        chats = st.session_state.setdefault("agent_chats", {})
+        transcript = chats.setdefault(chat_key, {"messages": [], "details": {}})
+        if transcript["messages"]:
+            with history_area.container():
+                render_agent_transcript(transcript["messages"])
+        chat_input_key = f"robot_chat_input_{note.name}"
+        if isinstance(queued_prompt, str) and queued_prompt.strip():
+            st.session_state[chat_input_key] = queued_prompt
+        with input_area:
+            chat_prompt = st.chat_input(
+                f"Extra instructions for {selected_action.name} (optional)" if selected_action else "Message the Robot",
+                key=chat_input_key,
+            )
+        message = chat_prompt.strip() if chat_prompt else ""
+        if message or (run_action and selected_action is not None):
+            agent_prompt = build_action_prompt(selected_action, note.name, message) if selected_action else message
+            display_message = f"⚡ {selected_action.name}" if selected_action else message
+            if selected_action and message:
+                display_message += f"\n\n{message}"
+            transcript["messages"].append({"role": "user", "content": display_message})
+            try:
+                start_agent_command(
+                    project, note, agent_prompt, tools_dir, config.agent, selected_model,
+                    config.agent_timeout_seconds, mode="chat", chat_key=chat_key,
+                    chat_details=transcript["details"],
+                )
+                if selected_action is not None:
+                    # Clear the attachment before recreating its widgets after the run.
+                    st.session_state.pending_robot_action_reset = {
+                        "selector_key": selector_key, "popover_key": popover_key,
+                    }
+                if selected_model:
+                    agent_model_preferences()[config.agent] = selected_model
+                st.session_state.last_agent_error = None
+            except (OSError, GitError, AgentError) as exc:
+                transcript["messages"].pop()
+                st.session_state.last_agent_error = f"Could not start robot chat: {exc}"
+            st.rerun()
+        return
+
+    with input_area:
+        columns = st.columns(
+            [0.25, 0.60, 0.15] if actions else [0.85, 0.15],
+            vertical_alignment="bottom",
+            gap="small",
+        )
+        selected_action = None
+        if actions:
+            with columns[0]:
+                selected_action = st.selectbox(
+                    "Action",
+                    [None, *actions],
+                    format_func=action_option_label,
+                    key=action_selector_key(note),
+                    label_visibility="collapsed",
+                )
+        with columns[-2]:
+            prompt = st.text_area(
+                "Message",
+                height=68,
+                key=prompt_key,
+                label_visibility="collapsed",
+                placeholder="Describe what the Robot should do…",
+            )
+        with columns[-1]:
+            submitted = st.button(
+                "Run robot",
+                key=f"run_agent_{note.name}_{st.session_state.editor_revision}",
+                width="stretch",
+            )
     if submitted and (prompt.strip() or selected_action is not None):
         agent_prompt = (
             build_action_prompt(selected_action, note.name, prompt)
@@ -3694,7 +3839,6 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
                 selected_model,
                 config.agent_timeout_seconds,
             )
-            st.session_state.last_agent_model = selected_model
             if selected_model:
                 agent_model_preferences()[config.agent] = selected_model
             st.session_state.last_agent_error = None

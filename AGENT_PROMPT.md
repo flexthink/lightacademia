@@ -7,12 +7,15 @@ Available tools root: {{tools_root}}
 Tools environment variable: LIGHTACADEMIA_TOOLS={{tools_root}}
 Current note: {{current_note}}
 
+{{context_specific_instructions}}
+
 Rules:
 - Read files inside the selected project root.
 - Update files only inside the selected project root.
 - Use the project `data/` directory for logs, training job outputs, exported metrics, query results, CSV or JSON summaries, and lightweight tables.
 - Do not use `data/` for raw datasets or full dataset management.
-- When a CSV should be shown as an interactive table in Light Academia, reference it from Markdown with a project-relative dataframe link such as `[dataframe](data/metrics.csv)`.
+- To embed any CSV as an interactive dataframe in Light Academia, insert the exact Markdown construct `[dataframe](data/file.csv)` on a line by itself. The visible link label must be exactly `dataframe`; do not replace it with a title, filename, caption, or descriptive label. A link such as `[status report](data/status.csv)` is only a downloadable file link and will not render as a dataframe.
+- When the user asks to add, show, display, embed, or include a dataframe or table for a CSV, update the selected note with that exact standalone `[dataframe](...)` construct. Do not merely create the CSV or add an ordinary link to it.
 - Keep dataframe CSV files inside the selected project, usually under `data/`; plain Markdown readers will show the dataframe syntax as a normal link.
 - Use project-relative Markdown links. Never write absolute local filesystem paths into notes; root-level `.md` note links should use the note filename, such as `[Results](Results.md)`.
 - When a board request provides a board data file, write the fetched rows to that exact project-relative CSV path. The board preview reads that file directly.
@@ -46,9 +49,6 @@ Rules:
 - Do not read or update sibling projects or parent notebook files.
 - Do not run git commands. Git is reserved for the Light Academia application.
 - You may run non-git shell commands when useful, subject to the project/tools/network restrictions above.
-- Do not ask follow-up questions. Make reasonable assumptions and complete the request non-interactively.
-- Keep changes focused on the user's request.
-- In your final response, summarize what you changed and mention any files touched.
 - Never delete ```action``` blocks in notes when updating
 
 User request:

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, IO, Any, Protocol, runtime_checkable
 
+from lightacademia.agent_progress import ActivityUpdate, AgentProgress
+
 if TYPE_CHECKING:
     from openai_codex.models import Notification
 
@@ -54,15 +56,11 @@ class AgentResult:
     returncode: int = 0
 
 
-@dataclass(frozen=True)
-class AgentProgress:
-    event_type: str
-    text: str
-
-
 ProgressCallback = Callable[[AgentProgress], None]
 StopCallback = Callable[[], bool]
 DEFAULT_PROMPT_TEMPLATE = Path(__file__).resolve().parent.parent / "AGENT_PROMPT.md"
+ACTION_PROMPT_TEMPLATE = Path(__file__).resolve().parent.parent / "AGENT_PROMPT_ACTION.md"
+CHAT_PROMPT_TEMPLATE = Path(__file__).resolve().parent.parent / "AGENT_PROMPT_CHAT.md"
 
 
 class Agent(Protocol):
@@ -75,6 +73,33 @@ class Agent(Protocol):
         on_progress: ProgressCallback | None = None,
         should_stop: StopCallback | None = None,
     ) -> AgentResult:
+        pass
+
+
+@dataclass(frozen=True)
+class AgentChatResult:
+    """One asynchronous chat turn and the opaque state for its next turn."""
+
+    response: str
+    details: dict[str, Any] = field(default_factory=dict)
+    tool_actions: list[str] = field(default_factory=list)
+    raw_stdout: str = ""
+
+
+@runtime_checkable
+class ChatCapableAgent(Protocol):
+    """Optional capability for agents that retain context across chat turns."""
+
+    supports_chat: bool
+
+    def chat(
+        self,
+        prompt: str,
+        context: AgentContext,
+        details: dict[str, Any] | None = None,
+        on_progress: ProgressCallback | None = None,
+        should_stop: StopCallback | None = None,
+    ) -> AgentChatResult:
         pass
 
 
@@ -94,13 +119,23 @@ class AgentSupport:
     def __init__(self, *, prompt_template: Path | None = None) -> None:
         self.prompt_template = prompt_template or DEFAULT_PROMPT_TEMPLATE
 
-    def _build_prompt(self, prompt: str, context: AgentContext, tools_workspace: Path | None = None) -> str:
+    def _build_prompt(
+        self,
+        prompt: str,
+        context: AgentContext,
+        tools_workspace: Path | None = None,
+        *,
+        prompt_template: Path | None = None,
+    ) -> str:
         current_note = context.current_note or "none"
         tools_root = tools_workspace or context.tools_dir
         try:
             template = self.prompt_template.read_text(encoding="utf-8")
+            if prompt_template is not None:
+                context_instructions = prompt_template.read_text(encoding="utf-8").strip()
+                template = template.replace("{{context_specific_instructions}}", context_instructions)
         except OSError as exc:
-            raise AgentError(f"Could not read agent prompt template: {self.prompt_template}") from exc
+            raise AgentError(f"Could not read agent prompt template: {prompt_template or self.prompt_template}") from exc
 
         replacements = {
             "{{project_name}}": context.project_name,
@@ -109,6 +144,7 @@ class AgentSupport:
             "{{tools_root}}": str(tools_root),
             "{{current_note}}": current_note,
             "{{user_prompt}}": prompt,
+            "{{context_specific_instructions}}": "",
         }
         for placeholder, value in replacements.items():
             template = template.replace(placeholder, value)
@@ -139,6 +175,7 @@ class AgentSupport:
 class CodexSdkAgent(AgentSupport):
     name = "Codex SDK"
     supports_model_selection = True
+    supports_chat = True
 
     def __init__(
         self,
@@ -155,12 +192,22 @@ class CodexSdkAgent(AgentSupport):
         self.model = model.strip() if model and model.strip() else None
 
     def available_models(self) -> list[str]:
-        """Return models available to the authenticated Codex SDK session."""
+        """Return selectable models with the SDK default first."""
         if Codex is None:
             raise _missing_codex_sdk_error()
         try:
             with Codex() as codex:
-                return [model.model for model in codex.models().data]
+                models = codex.models().data
+                model_names = [
+                    model.model
+                    for model in [
+                        *(model for model in models if model.is_default),
+                        *(model for model in models if not model.is_default),
+                    ]
+                ]
+                if "gpt-reserve" not in model_names:
+                    model_names.append("gpt-reserve")
+                return list(dict.fromkeys(model_names))
         except (CodexError, OSError, RuntimeError) as exc:
             raise AgentError(f"Could not list Codex models: {exc}") from exc
 
@@ -193,7 +240,9 @@ class CodexSdkAgent(AgentSupport):
                     sandbox=sdk_sandbox,
                     config=thread_config,
                 )
-                turn = thread.turn(self._build_prompt(prompt, context, tools_workspace))
+                turn = thread.turn(self._build_prompt(
+                    prompt, context, tools_workspace, prompt_template=ACTION_PROMPT_TEMPLATE
+                ))
                 stop_watcher_done = threading.Event()
                 timed_out = threading.Event()
                 deadline = time.monotonic() + self.timeout_seconds
@@ -246,6 +295,100 @@ class CodexSdkAgent(AgentSupport):
             raise
         except (CodexError, OSError, RuntimeError, ValueError) as exc:
             raise AgentError(f"Codex SDK failed: {exc}") from exc
+        finally:
+            temporary.cleanup()
+
+    def chat(
+        self,
+        prompt: str,
+        context: AgentContext,
+        details: dict[str, Any] | None = None,
+        on_progress: ProgressCallback | None = None,
+        should_stop: StopCallback | None = None,
+    ) -> AgentChatResult:
+        """Run a turn in a Codex thread, returning its ID for subsequent turns.
+
+        The caller owns the returned details and can persist them between async
+        calls. Only the thread ID is needed to continue a Codex conversation.
+        """
+        if Codex is None or CodexConfig is None or Sandbox is None:
+            raise _missing_codex_sdk_error()
+        details = dict(details or {})
+        thread_id = details.get("thread_id")
+        temporary = tempfile.TemporaryDirectory(prefix="lightacademia-codex-chat-")
+        tools_workspace = Path(temporary.name) / "tools"
+        self._copy_tools_dir(context.tools_dir, tools_workspace)
+        try:
+            config = CodexConfig(env=self._build_environment(tools_workspace))
+            thread_config = {
+                "sandbox_workspace_write": {
+                    "network_access": self.network_access,
+                    "writable_roots": [str(tools_workspace.resolve())],
+                }
+            }
+            with Codex(config) as codex:
+                if thread_id:
+                    thread = codex.thread_resume(
+                        str(thread_id), cwd=str(context.project_dir), model=self.model,
+                        sandbox=Sandbox(self.sandbox), config=thread_config,
+                    )
+                else:
+                    thread = codex.thread_start(
+                        cwd=str(context.project_dir), model=self.model,
+                        sandbox=Sandbox(self.sandbox), config=thread_config,
+                    )
+                turn = thread.turn(self._build_prompt(
+                    prompt, context, tools_workspace, prompt_template=CHAT_PROMPT_TEMPLATE
+                ))
+                stop_watcher_done = threading.Event()
+                timed_out = threading.Event()
+                deadline = time.monotonic() + self.timeout_seconds
+
+                def watch_for_stop() -> None:
+                    while not stop_watcher_done.wait(0.1):
+                        if should_stop is not None and should_stop():
+                            turn.interrupt()
+                            return
+                        if time.monotonic() >= deadline:
+                            timed_out.set()
+                            turn.interrupt()
+                            return
+
+                watcher = threading.Thread(target=watch_for_stop, daemon=True)
+                watcher.start()
+                events: list[dict[str, Any]] = []
+                actions: list[str] = []
+                response = ""
+                try:
+                    for notification in turn.stream():
+                        event = codex_event_from_notification(notification)
+                        events.append(event)
+                        progress = codex_progress_from_event(event)
+                        if progress is not None and on_progress is not None:
+                            on_progress(progress)
+                        action = codex_tool_action_from_event(event)
+                        if action:
+                            actions.append(action)
+                        item = event.get("item")
+                        if (event.get("type") == "item.completed" and isinstance(item, dict)
+                                and item.get("type") == "agent_message"):
+                            response = event_text(item)
+                finally:
+                    stop_watcher_done.set()
+                    watcher.join(timeout=1)
+                if timed_out.is_set():
+                    raise AgentError(f"Codex SDK timed out after {self.timeout_seconds} seconds.")
+                if should_stop is not None and should_stop():
+                    raise AgentStopped("Agent chat stopped by user.")
+                next_details = {**details, "thread_id": str(thread.id)}
+                return AgentChatResult(
+                    response=response.strip(), details=next_details, tool_actions=actions,
+                    raw_stdout="\n".join(json.dumps(event, ensure_ascii=False) for event in events),
+                )
+        except AgentError:
+            raise
+        except (CodexError, OSError, RuntimeError, ValueError) as exc:
+            raise AgentError(f"Codex SDK chat failed: {exc}") from exc
         finally:
             temporary.cleanup()
 
@@ -519,7 +662,7 @@ def codex_event_from_notification(notification: "Notification") -> dict[str, Any
             "webSearch": "web_search",
         }.get(item_type, item_type)
         if item.get("type") == "reasoning":
-            item["text"] = "\n".join(item.get("summary") or item.get("content") or [])
+            item["text"] = event_text(item.get("summary") or item.get("content"))
     if event_type in {"turn.started", "turn.completed"}:
         turn = event.get("turn")
         if isinstance(turn, dict):
@@ -542,27 +685,76 @@ def event_text(value: Any) -> str:
 
 
 def codex_progress_from_event(event: dict[str, Any]) -> AgentProgress | None:
+    """Adapt SDK snapshots/deltas to the provider-independent activity contract."""
     event_type = str(event.get("type") or "event")
-    if event_type == "thread.started":
-        return AgentProgress(event_type, f"Session started: {event.get('thread_id', 'unknown')}")
-    if event_type == "turn.started":
-        return AgentProgress(event_type, "Turn started")
-    if event_type == "turn.completed":
-        usage = event.get("usage")
-        detail = json.dumps(usage, indent=2, ensure_ascii=False) if usage else "Turn completed"
-        return AgentProgress(event_type, detail)
-    if event_type in {"turn.failed", "error"}:
-        return AgentProgress(event_type, event_text(event) or _pretty_event(event))
+    lifecycle = {"thread.started", "turn.started", "turn.completed", "turn.failed", "error"}
+    if event_type in lifecycle:
+        failed = event_type in {"turn.failed", "error"}
+        turn = event.get("turn")
+        if isinstance(turn, dict) and turn.get("status") in {"failed", "interrupted"}:
+            failed = True
+        state = "error" if failed else "complete" if event_type == "turn.completed" else "running"
+        detail = event_text(event.get("error")) or event_text(turn.get("error") if isinstance(turn, dict) else None) or event_text(event)
+        update = ActivityUpdate(None, "error" if failed else "lifecycle", "Error" if failed else "Robot activity", state, {"text": detail} if detail else {})
+        return AgentProgress(event_type, detail or event_type, update)
+
+    delta_types = {
+        "item.agentMessage.delta": ("message", "Reply", "text"),
+        "item.reasoning.summaryTextDelta": ("reasoning", "Thinking", f"summary:{event.get('summary_index', 0):04d}"),
+        "item.reasoning.textDelta": ("reasoning", "Thinking", f"content:{event.get('content_index', 0):04d}"),
+        "item.commandExecution.outputDelta": ("command", "Command", "output"),
+        "item.fileChange.outputDelta": ("files", "File changes", "output"),
+        "item.plan.delta": ("plan", "Plan", "text"),
+    }
+    if event_type in delta_types:
+        kind, label, section = delta_types[event_type]
+        text = event_text(event.get("delta"))
+        return AgentProgress(event_type, text, ActivityUpdate(event.get("item_id"), kind, label, content={section: text}, append=True))
+
+    if event_type == "item.mcpToolCall.progress":
+        text = event_text(event.get("message"))
+        return AgentProgress(event_type, text, ActivityUpdate(event.get("item_id"), "tool", "Tool call", content={"progress": text + "\n"}, append=True))
 
     item = event.get("item")
-    if not event_type.startswith("item.") or not isinstance(item, dict):
+    if event_type not in {"item.started", "item.updated", "item.completed"} or not isinstance(item, dict):
         return None
-
     item_type = str(item.get("type") or "item")
     phase = event_type.removeprefix("item.")
+    failed = item.get("status") in {"failed", "declined"} or bool(item.get("error")) or item.get("exit_code") not in {None, 0}
+    state = "error" if failed else "complete" if phase == "completed" else "running"
+    kinds = {
+        "agent_message": ("message", "Reply"), "reasoning": ("reasoning", "Thinking"),
+        "command_execution": ("command", "Command"), "file_change": ("files", "File changes"),
+        "mcp_tool_call": ("tool", ".".join(str(item[k]) for k in ("server", "tool") if item.get(k)) or "Tool call"),
+        "web_search": ("search", "Web search"), "plan": ("plan", "Plan"),
+        "plan_update": ("plan", "Plan"), "todo_list": ("plan", "Plan"),
+    }
+    kind, label = kinds.get(item_type, ("log", "Activity"))
+    content = {}
+    if kind == "reasoning":
+        for channel in ("summary", "content"):
+            for index, part in enumerate(item.get(channel) or []):
+                content[f"{channel}:{index:04d}"] = event_text(part)
+        if not any(content.values()) and item.get("text"):
+            content["summary:0000"] = event_text(item["text"])
+    elif kind == "command":
+        if item.get("command"):
+            content["command"] = f"$ {item['command']}"
+        output = item.get("aggregated_output") or item.get("output")
+        if output:
+            content["output"] = event_text(output)
+        if item.get("exit_code") is not None:
+            content["exit_code"] = f"Exit code: {item['exit_code']}"
+    elif kind == "files":
+        for index, change in enumerate(item.get("changes") or []):
+            if isinstance(change, dict):
+                content[f"file:{index}"] = "\n".join(str(change[k]) for k in ("path", "diff") if change.get(k))
+    else:
+        content["text"] = _codex_item_detail(item)
     detail = _codex_item_detail(item)
     heading = f"{item_type} {phase}"
-    return AgentProgress(event_type, f"{heading}\n{detail}" if detail else heading)
+    update = ActivityUpdate(item.get("id"), kind, label, state, content)
+    return AgentProgress(event_type, f"{heading}\n{detail}" if detail else heading, update)
 
 
 def _codex_item_detail(item: dict[str, Any]) -> str:

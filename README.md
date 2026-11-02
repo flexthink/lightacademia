@@ -163,8 +163,9 @@ starting the app with `--agent codex`:
 pip install -r requirements-codex.txt
 ```
 
-When using Codex, select a specific model with `--codex-model`; omit it to use
-the model selected by the Codex SDK runtime:
+When using Codex, the default model is `gpt-reserve`. Select a different startup
+default with `--codex-model`. Choices made in the Model picker stick for the current
+session only; new sessions start with the configured default:
 
 ```bash
 python -m streamlit run app.py -- --agent codex --codex-model gpt-5-codex
