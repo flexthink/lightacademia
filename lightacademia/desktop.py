@@ -12,6 +12,8 @@ import time
 from urllib.error import URLError
 from urllib.request import ProxyHandler, build_opener
 
+from .directory_picker import directory_picker_bridge
+
 APP_NAME = "Light Academia"
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
@@ -103,17 +105,26 @@ def main(argv: list[str] | None = None) -> int:
                     "--agent-timeout-seconds", str(args.agent_timeout_seconds)]
         if args.codex_model:
             command += ["--codex-model", args.codex_model]
-        process = subprocess.Popen(command, cwd=ROOT)
-        try:
-            wait_for_server(process, url)
-            webview.create_window(APP_NAME, url, width=1440, height=960, min_size=(900, 600),
-                                  text_select=True)
-            webview.start(debug=args.debug, icon=str(ROOT / "assets" / "logo.png"))
-        finally:
-            stop_server(process)
+        def pick_directory():
+            selected = webview.windows[0].create_file_dialog(webview.FileDialog.FOLDER, allow_multiple=False)
+            return str(selected[0]) if selected else None
+
+        with directory_picker_bridge(pick_directory) as picker_environment:
+            return run_window(command, url, webview, args.debug, picker_environment)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
         print(f"{APP_NAME}: {exc}", file=sys.stderr)
         return 1
+
+
+def run_window(command, url, webview, debug, picker_environment) -> int:
+    process = subprocess.Popen(command, cwd=ROOT, env={**os.environ, **picker_environment})
+    try:
+        wait_for_server(process, url)
+        webview.create_window(APP_NAME, url, width=1440, height=960, min_size=(900, 600),
+                              text_select=True)
+        webview.start(debug=debug, icon=str(ROOT / "assets" / "logo.png"))
+    finally:
+        stop_server(process)
     return 0

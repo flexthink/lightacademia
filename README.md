@@ -270,3 +270,16 @@ Claude Code CLI support is also available with `--agent claude`:
 - Adds a temporary copy of the configured tools folder with `--add-dir`
 - Uses `acceptEdits` permission mode and allows common file/shell tools
 - Streams Claude JSON events into the same pinned agent progress section
+
+### Additional project directories
+
+Open a project's **Settings** and use **Add directory** to choose a local codebase
+or other directory with the desktop app's native folder picker. Settings lists the
+added directories with a trash button for each. Adding or removing a directory is
+saved immediately and applies to the next agent run, including subsequent chat
+turns. Both Codex and Claude can read and update the added directories.
+
+Paths are stored in the project's `meta.yaml` under `local_directories`. Paths
+under your home directory are saved with `~` (for example, `~/Projects/my-code`)
+and expanded when the agent uses them. The native picker requires the desktop
+launcher.

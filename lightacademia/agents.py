@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, IO, Any, Protocol, runtime_checkable
 
 from lightacademia.agent_progress import ActivityUpdate, AgentProgress
+from lightacademia.storage import Project, project_local_directories
 
 if TYPE_CHECKING:
     from openai_codex.models import Notification
@@ -157,6 +158,21 @@ class AgentSupport:
                 "- Do not access folders outside the selected project root and available tools root.\n"
                 "- Do not read or update sibling projects or parent notebook files."
             )
+        directories = self._local_directories(context)
+        if directories:
+            access_rules = access_rules.replace(
+                "and available tools root", "and available tools root and additional local directories"
+            ).replace(
+                "- Update files only inside the selected project root.",
+                "- Update files inside the selected project root and additional local directories."
+            )
+            access_rules = access_rules.replace(
+                "- Do not read or update sibling projects or parent notebook files.",
+                "- Do not read or update sibling projects or parent notebook files unless they are explicitly listed as additional local directories."
+            )
+            access_rules += "\n- Additional local directories (read and update access):\n" + "\n".join(
+                f"  - {directory}" for directory in directories
+            )
         replacements = {
             "{{workspace_access_rules}}": access_rules,
             "{{project_name}}": context.project_name,
@@ -171,14 +187,20 @@ class AgentSupport:
             template = template.replace(placeholder, value)
         return template
 
+    def _local_directories(self, context: AgentContext) -> list[str]:
+        return [str(Path(value).expanduser().resolve()) for value in
+                project_local_directories(Project(context.project_name, context.project_dir))]
+
     def _writable_roots(self, context: AgentContext, tools_workspace: Path) -> list[str]:
-        roots = [str(tools_workspace.resolve())]
+        roots = [str(tools_workspace.resolve()), *self._local_directories(context)]
         if context.notebook_dir is not None:
             roots.append(str(context.notebook_dir.resolve()))
         return roots
 
     def _build_environment(self, tools_root: Path) -> dict[str, str]:
         environment = os.environ.copy()
+        environment.pop("LIGHTACADEMIA_PICKER_URL", None)
+        environment.pop("LIGHTACADEMIA_PICKER_TOKEN", None)
         environment["LIGHTACADEMIA_TOOLS"] = str(tools_root.resolve())
         return environment
 
@@ -480,6 +502,8 @@ class ClaudeCliAgent(AgentSupport):
             ["--add-dir", str(context.notebook_dir.resolve())]
             if context.notebook_dir is not None else []
         )
+        for directory in self._local_directories(context):
+            additional_directories.extend(["--add-dir", directory])
         return [
             executable,
             "--print",

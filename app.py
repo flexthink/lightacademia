@@ -38,6 +38,8 @@ from streamlit.components.v2.manifest_scanner import ComponentConfig, ComponentM
 from streamlit_extras.resizable_columns import resizable_columns
 
 from lightacademia.desktop import script_python
+from lightacademia.directory_picker import pick_local_directory
+from lightacademia.storage import project_local_directories, save_project_local_directories
 from lightacademia.agent_progress import finish_activities, reduce_progress
 from lightacademia.agent_ui import render_agent_activities, render_agent_transcript
 from lightacademia.actions import NoteAction, build_action_prompt, format_note_action, parse_note_actions
@@ -664,6 +666,26 @@ def archive_project_dialog(notebook_dir: Path, project: Project, current_note_to
 @st.dialog("Settings", icon=":material/settings:")
 def settings_dialog(project: Project, note) -> None:
     note_title = st.text_input("Name", value=note.path.stem, disabled=project.name == DAILY_NOTES_PROJECT, key=f"settings_note_name_{project.name}_{note.name}")
+    st.markdown("**Additional local directories**")
+    st.caption("The agent can read and update these directories in addition to the project workspace. Changes take effect on the next agent run.")
+    directories = project_local_directories(project)
+    for index, directory in enumerate(directories):
+        path_column, delete_column = st.columns([8, 1], vertical_alignment="center")
+        path_column.code(directory, language=None)
+        if delete_column.button("Remove", icon=":material/delete:", key=f"remove_directory_{project.name}_{index}", help=f"Remove {directory}"):
+            try:
+                save_project_local_directories(project, [value for value in directories if value != directory])
+                st.rerun(scope="fragment")
+            except (OSError, ValueError) as exc:
+                st.error(f"Could not remove directory: {exc}")
+    if st.button("Add directory", icon=":material/add:", key=f"add_directory_{project.name}"):
+        try:
+            selected = pick_local_directory()
+            if selected:
+                save_project_local_directories(project, [*directories, selected])
+                st.rerun(scope="fragment")
+        except (OSError, ValueError) as exc:
+            st.error(f"Could not add directory: {exc}")
     current_remote = git_remote_url(project.path) or ""
     remote_url = st.text_input("Remote URL", value=current_remote, key=f"remote_url_{project.name}")
     st.caption("Leave empty and save to remove the configured remote.")

@@ -247,3 +247,30 @@ def daily_notes_by_date(project: Project) -> dict[date, Note]:
         if day.isoformat() == note.path.stem:
             result[day] = note
     return result
+
+
+def project_local_directories(project: Project) -> list[str]:
+    """Return configured paths without expanding home-relative values."""
+    path = project.path / "meta.yaml"
+    meta = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    values = (meta or {}).get("local_directories", [])
+    return list(dict.fromkeys(value for value in values if isinstance(value, str) and value)) if isinstance(values, list) else []
+
+
+def save_project_local_directories(project: Project, directories: list[str]) -> None:
+    path = project.path / "meta.yaml"
+    meta = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    meta = meta or {}
+    normalized = []
+    for value in directories:
+        directory = Path(value).expanduser()
+        if not directory.is_absolute():
+            raise ValueError("Select an absolute directory path.")
+        try:
+            value = str(Path("~") / directory.relative_to(Path.home()))
+        except ValueError:
+            value = str(directory)
+        if value not in normalized:
+            normalized.append(value)
+    meta["local_directories"] = normalized
+    path.write_text(yaml.safe_dump(meta, sort_keys=False), encoding="utf-8")
