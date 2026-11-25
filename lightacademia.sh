@@ -1,9 +1,6 @@
 #!/bin/zsh
 
-cd "$HOME/Projects/lightacademia" || exit 1
-
-source $HOME/venv/ml/bin/activate
-
-streamlit run app.py --server.port 8599 --server.headless true -- --codex-agent gpt-5.6-luna &
-echo $! > /tmp/lightacademia.pid
-
+# Run from any directory, using the active environment or an explicit interpreter.
+cd "${0:A:h}" || exit 1
+exec "${LIGHTACADEMIA_PYTHON:-python3}" -m lightacademia \
+  --notebook "$PWD/notebook" --tools "$PWD/tools" "$@"

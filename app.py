@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import hashlib
 import html
 import importlib.metadata
@@ -36,6 +37,7 @@ from streamlit.components.v2.get_bidi_component_manager import get_bidi_componen
 from streamlit.components.v2.manifest_scanner import ComponentConfig, ComponentManifest
 from streamlit_extras.resizable_columns import resizable_columns
 
+from lightacademia.desktop import script_python
 from lightacademia.agent_progress import finish_activities, reduce_progress
 from lightacademia.agent_ui import render_agent_activities, render_agent_transcript
 from lightacademia.actions import NoteAction, build_action_prompt, format_note_action, parse_note_actions
@@ -117,6 +119,10 @@ from lightacademia.routing import WorkspaceRoute
 from lightacademia.search import SearchUnavailable, search_notes
 from lightacademia.storage import (
     HOME_NOTE,
+    DAILY_NOTES_PROJECT,
+    daily_notes_project,
+    daily_notes_by_date,
+    get_or_create_daily_note,
     Project,
     archive_note,
     archive_project,
@@ -152,6 +158,7 @@ DEFAULT_TOOLS_DIR = Path("tools")
 DEFAULT_AUTOCOMMIT_SECONDS = 5 * 60
 DEFAULT_CODEX_MODEL = "gpt-reserve"
 NOTE_PANE_HEIGHT = 430
+ROBOT_CHAT_HEIGHT = 280
 ICON_BUTTON_LABEL = ""
 LOGO_PATH = Path("assets/logo.png")
 THEME_CSS_PATH = Path("assets/theme.css")
@@ -380,7 +387,9 @@ def workspace_navigation_route(
     projects: list[dict[str, str]] | None = None,
     notes: list[dict[str, str]] | None = None,
 ) -> WorkspaceRoute:
-    pending_route = st.session_state.pop("pending_hash_route", None)
+    pending_route = (
+        st.session_state.pop("pending_hash_route", None) if mode == "projects" else None
+    )
     result = workspace_navigation_component()(
         key=key,
         data={
@@ -391,14 +400,15 @@ def workspace_navigation_route(
             "notes": notes or [],
             "pushRoute": pending_route or {},
         },
-        default={"route": {"project": project_name, "note": note_name or ""}},
-        on_route_change=lambda: None,
+        on_route_requested_change=lambda: None,
     )
     if mode != "projects":
         return WorkspaceRoute(project_name, note_name)
+    if pending_route:
+        return WorkspaceRoute(pending_route["project"], pending_route.get("note") or None)
     if not isinstance(result, dict):
         return WorkspaceRoute(project_name, note_name)
-    route = result.get("route")
+    route = result.get("route_requested")
     if not isinstance(route, dict):
         return WorkspaceRoute(project_name, note_name)
     selected_project = route.get("project")
@@ -653,7 +663,7 @@ def archive_project_dialog(notebook_dir: Path, project: Project, current_note_to
 
 @st.dialog("Settings", icon=":material/settings:")
 def settings_dialog(project: Project, note) -> None:
-    note_title = st.text_input("Name", value=note.path.stem, key=f"settings_note_name_{project.name}_{note.name}")
+    note_title = st.text_input("Name", value=note.path.stem, disabled=project.name == DAILY_NOTES_PROJECT, key=f"settings_note_name_{project.name}_{note.name}")
     current_remote = git_remote_url(project.path) or ""
     remote_url = st.text_input("Remote URL", value=current_remote, key=f"remote_url_{project.name}")
     st.caption("Leave empty and save to remove the configured remote.")
@@ -674,6 +684,54 @@ def settings_dialog(project: Project, note) -> None:
             st.rerun()
         except (OSError, GitError) as exc:
             st.error(f"Could not save settings: {exc}")
+
+
+@st.dialog("Daily Notes", icon=":material/calendar_month:")
+def daily_notes_calendar_dialog(daily_project: Project, project: Project, note) -> None:
+    today = date.today()
+    month = st.session_state.get("daily_calendar_month", today.replace(day=1))
+    previous, heading, following = st.columns([1, 3, 1])
+    if previous.button("Previous", key="daily_previous_month"):
+        month = date.fromordinal(month.toordinal() - 1).replace(day=1)
+        st.session_state.daily_calendar_month = month
+    if following.button("Next", key="daily_next_month"):
+        month = date(month.year + (month.month == 12), month.month % 12 + 1, 1)
+        st.session_state.daily_calendar_month = month
+    heading.markdown(f"**{month:%B %Y}**")
+    entries = daily_notes_by_date(daily_project)
+    st.caption("● marks a day with a daily note. Select a marked day to open it.")
+    for column, label in zip(st.columns(7), calendar.day_abbr):
+        column.caption(label)
+    for week in calendar.Calendar().monthdatescalendar(month.year, month.month):
+        for column, day in zip(st.columns(7), week):
+            if day.month != month.month:
+                column.write("")
+                continue
+            exists = day in entries
+            if column.button(
+                f"{day.day} ●" if exists else str(day.day),
+                key=f"daily_calendar_{day.isoformat()}",
+                disabled=not exists,
+                help=day.isoformat(),
+                width="stretch",
+                type="primary" if exists else "secondary",
+            ):
+                commit_before_navigation(project, current_note_to_save=note,
+                                         next_project=daily_project.name, next_note=entries[day].name)
+
+
+def render_daily_notes_controls(daily_project: Project, project: Project, note) -> None:
+    st.markdown("### Daily Notes")
+    add, browse = st.columns([1, 1])
+    if add.button("Today", key="add_daily_note", icon=":material/add:", width="stretch"):
+        try:
+            daily_note = get_or_create_daily_note(daily_project, date.today())
+            commit_before_navigation(project, current_note_to_save=note,
+                                     next_project=daily_project.name, next_note=daily_note.name)
+        except (OSError, GitError) as exc:
+            st.error(f"Could not open daily note: {exc}")
+    if browse.button("Calendar", key="daily_notes_calendar", icon=":material/calendar_month:", width="stretch"):
+        daily_notes_calendar_dialog(daily_project, project, note)
 
 
 @st.dialog("New note", icon=":material/note_add:")
@@ -1657,6 +1715,8 @@ def build_tools_tree(tools_dir: Path) -> dict[str, object]:
 def project_navigation_items(projects: list[Project]) -> list[dict[str, str]]:
     items = []
     for project in projects:
+        if project.name == DAILY_NOTES_PROJECT:
+            continue
         notes = list_notes(project)
         note_names = [note.name for note in notes]
         default_note = HOME_NOTE if HOME_NOTE in note_names else (note_names[0] if note_names else "")
@@ -1791,11 +1851,12 @@ def commit_before_navigation(
     clear_history_revision()
     st.session_state.requested_action = None
     st.session_state.queued_agent_prompt = None
-    if not hash_updated:
-        queue_hash_route(
-            next_project or project.name,
-            next_note if next_note is not None else st.session_state.note_name,
-        )
+    # Acknowledge the resolved route even when the browser initiated it.
+    # This also canonicalizes links whose requested note no longer exists.
+    queue_hash_route(
+        next_project or project.name,
+        next_note if next_note is not None else st.session_state.note_name,
+    )
     st.session_state.editor_revision += 1
     st.rerun()
 
@@ -2403,7 +2464,7 @@ def run_fast_board_fetch(board: NoteBoard, project_dir: Path, script_path: Path)
     with st.spinner(f"Refreshing {board.name}..."):
         try:
             result = subprocess.run(
-                [sys.executable, str(relative_script)],
+                [script_python(), str(relative_script)],
                 cwd=project_dir.resolve(),
                 capture_output=True,
                 text=True,
@@ -2456,7 +2517,7 @@ def run_fast_board_action(
     with st.spinner(f"Running: {action.name}"):
         try:
             command = [
-                sys.executable,
+                script_python(),
                 str(relative_script),
                 "--row-json",
                 row_json,
@@ -2977,7 +3038,7 @@ def start_gardener_script_run(
     st.session_state.last_gardener_result = None
     st.session_state.gardener_progress_entries = [
         f"[gardener]\nStarting cached action: {task.action_name}",
-        f"[command]\n{shlex.join([sys.executable, str(script_path.relative_to(project.path.resolve())), '--source-note', note.name])}",
+        f"[command]\n{shlex.join([script_python(), str(script_path.relative_to(project.path.resolve())), '--source-note', note.name])}",
     ]
     queue_gardener_notification(f"Gardener started: {task.action_name}", icon=":material/local_florist:")
     run_state.thread.start()
@@ -2994,7 +3055,7 @@ def _gardener_script_worker(run_state: GardenerScriptRunState) -> None:
             return
         relative_script = run_state.script_path.resolve().relative_to(project_root)
         command = [
-            sys.executable,
+            script_python(),
             str(relative_script),
             "--source-note",
             run_state.note_name,
@@ -3287,6 +3348,10 @@ def _agent_worker(run_state: AgentRunState) -> None:
         project_name=run_state.project.name,
         tools_dir=run_state.tools_dir,
         current_note=run_state.note_name or None,
+        notebook_dir=(
+            run_state.project.path.parent
+            if run_state.project.name == DAILY_NOTES_PROJECT else None
+        ),
     )
     try:
         if run_state.mode == "chat":
@@ -3624,7 +3689,7 @@ def render_agent_progress_panel() -> None:
         ):
             run_state.stop_requested.set()
             st.rerun()
-    with st.container(height=280, border=False, autoscroll=True):
+    with st.container(height=ROBOT_CHAT_HEIGHT, border=False, autoscroll=True, key="robot_history"):
         if run_state.chat_key:
             transcript = st.session_state.get("agent_chats", {}).get(run_state.chat_key, {})
             render_agent_transcript(transcript.get("messages", []))
@@ -3743,6 +3808,12 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
                         "Run action", key=f"run_chat_action_{note.name}_{st.session_state.editor_revision}",
                         icon=":material/bolt:", disabled=selected_action is None,
                     )
+        if supports_chat and st.button(
+            "New chat", key=f"new_robot_chat_{note.name}", icon=":material/add_comment:",
+        ):
+            chat_key = f"{project.path.resolve()}::{note.name}"
+            st.session_state.setdefault("agent_chats", {}).pop(chat_key, None)
+            st.rerun()
         with st.popover(
             "Settings",
             icon=":material/settings:",
@@ -3756,7 +3827,9 @@ def render_agent_form(project: Project, note, actions: tuple[NoteAction, ...], t
         chats = st.session_state.setdefault("agent_chats", {})
         transcript = chats.setdefault(chat_key, {"messages": [], "details": {}})
         if transcript["messages"]:
-            with history_area.container():
+            with history_area.container(
+                height=ROBOT_CHAT_HEIGHT, border=False, autoscroll=True, key="robot_history",
+            ):
                 render_agent_transcript(transcript["messages"])
         chat_input_key = f"robot_chat_input_{note.name}"
         if isinstance(queued_prompt, str) and queued_prompt.strip():
@@ -3862,7 +3935,8 @@ def main() -> None:
         ensure_tools_dir(tools_dir)
         ensure_tools_git_repo(tools_dir)
         reset_gardener_tasks_at_startup(str(notebook_dir.resolve()))
-        projects = list_projects(notebook_dir)
+        daily_project = daily_notes_project(notebook_dir)
+        projects = list_projects(notebook_dir) + [daily_project]
     except (OSError, GitError) as exc:
         st.error(f"Could not open workspace folders: {exc}")
         return
@@ -3914,6 +3988,7 @@ def main() -> None:
             st.session_state.queued_agent_prompt = None
             st.session_state.workspace_view = "tools"
             st.rerun()
+        render_daily_notes_controls(daily_project, project, note_before_project_navigation)
         st.divider()
 
         project_header, project_new, project_archive = st.columns([0.66, 0.17, 0.17], vertical_alignment="bottom")
@@ -3937,6 +4012,7 @@ def main() -> None:
             if st.button(
                 ICON_BUTTON_LABEL,
                 key="open_archive_project",
+                disabled=project.name == DAILY_NOTES_PROJECT,
                 help="Archive project",
                 icon=":material/archive:",
             ):
@@ -3971,7 +4047,12 @@ def main() -> None:
             help="New note",
             icon=":material/note_add:",
         ):
-            new_note_dialog(project)
+            if project.name == DAILY_NOTES_PROJECT:
+                daily_note = get_or_create_daily_note(daily_project, date.today())
+                commit_before_navigation(project, current_note_to_save=note_before_project_navigation,
+                                         next_note=daily_note.name)
+            else:
+                new_note_dialog(project)
 
     notes = list_notes(project)
     note = current_note(notes)
@@ -3981,7 +4062,7 @@ def main() -> None:
         return
 
     with st.sidebar:
-        st.markdown("### Notes")
+        st.markdown("### Daily Notes" if project.name == DAILY_NOTES_PROJECT else "### Notes")
         selected_route = workspace_navigation_route(
             mode="notes",
             project_name=project.name,
@@ -4025,7 +4106,8 @@ def main() -> None:
         )
         if search_query.strip():
             try:
-                search_results = search_notes(notes, search_query, limit=6)
+                searchable_notes = notes if project.name == DAILY_NOTES_PROJECT else notes + list(daily_notes_by_date(daily_project).values())
+                search_results = search_notes(searchable_notes, search_query, limit=6)
             except SearchUnavailable as exc:
                 st.warning(str(exc))
                 search_results = []
@@ -4043,7 +4125,9 @@ def main() -> None:
                     icon=":material/search:",
                     width="stretch",
                 ):
-                    commit_before_navigation(project, current_note_to_save=note, next_note=result.note.name)
+                    commit_before_navigation(project, current_note_to_save=note,
+                                             next_project=DAILY_NOTES_PROJECT if result.note.path.parent == daily_project.path else project.name,
+                                             next_note=result.note.name)
                 st.caption(result.snippet)
             if st.button(
                 "Clear search",

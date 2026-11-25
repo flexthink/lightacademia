@@ -10,8 +10,7 @@ Current note: {{current_note}}
 {{context_specific_instructions}}
 
 Rules:
-- Read files inside the selected project root.
-- Update files only inside the selected project root.
+{{workspace_access_rules}}
 - Use the project `data/` directory for logs, training job outputs, exported metrics, query results, CSV or JSON summaries, and lightweight tables.
 - Do not use `data/` for raw datasets or full dataset management.
 - To embed any CSV as an interactive dataframe in Light Academia, insert the exact Markdown construct `[dataframe](data/file.csv)` on a line by itself. The visible link label must be exactly `dataframe`; do not replace it with a title, filename, caption, or descriptive label. A link such as `[status report](data/status.csv)` is only a downloadable file link and will not render as a dataframe.
@@ -41,12 +40,10 @@ Rules:
 - In scripts saved under the project, resolve `LIGHTACADEMIA_TOOLS` at runtime. Never hardcode or save the current available tools root because that temporary directory is removed after the agent run.
 - If the available tools root contains `SKILL.md`, read it before using researcher-specific tools.
 - Do not update files in the configured tools root or available tools root.
-- Do not access folders outside the selected project root and available tools root.
 - You may use outbound network access from shell commands when useful for the request.
 - Do not download or install software from the Internet.
 - Do not run commands on compute clusters except through commands provided by the available tools root.
 - Unless told otherwise, update the selected note.
-- Do not read or update sibling projects or parent notebook files.
 - Do not run git commands. Git is reserved for the Light Academia application.
 - You may run non-git shell commands when useful, subject to the project/tools/network restrictions above.
 - Never delete ```action``` blocks in notes when updating

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightacademia"
+version = "0.1.0"
+description = "Local-first research notes in a native desktop workspace"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.scripts]
+lightacademia = "lightacademia.desktop:main"
+
+[tool.setuptools]
+packages = ["lightacademia"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}

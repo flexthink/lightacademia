@@ -44,6 +44,7 @@ class AgentContext:
     project_name: str
     tools_dir: Path
     current_note: str | None = None
+    notebook_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -137,7 +138,27 @@ class AgentSupport:
         except OSError as exc:
             raise AgentError(f"Could not read agent prompt template: {prompt_template or self.prompt_template}") from exc
 
+        if context.notebook_dir is not None:
+            access_rules = (
+                f"- Notebook root: {context.notebook_dir.resolve()}\n"
+                "- You are the Daily Notes robot. You may read and update any project "
+                "inside this notebook, including sibling projects. You do not need "
+                "the user to switch the selected project to access its notes.\n"
+                "- Keep the selected daily note as the default destination unless "
+                "the user requests an update elsewhere.\n"
+                "- Read each target project's SKILL.md before working in it. "
+                "Keep that project's assets, data, and scripts in its own directories.\n"
+                "- Do not access folders outside the notebook root and available tools root."
+            )
+        else:
+            access_rules = (
+                "- Read files inside the selected project root.\n"
+                "- Update files only inside the selected project root.\n"
+                "- Do not access folders outside the selected project root and available tools root.\n"
+                "- Do not read or update sibling projects or parent notebook files."
+            )
         replacements = {
+            "{{workspace_access_rules}}": access_rules,
             "{{project_name}}": context.project_name,
             "{{project_dir}}": str(context.project_dir),
             "{{tools_dir}}": str(context.tools_dir),
@@ -149,6 +170,12 @@ class AgentSupport:
         for placeholder, value in replacements.items():
             template = template.replace(placeholder, value)
         return template
+
+    def _writable_roots(self, context: AgentContext, tools_workspace: Path) -> list[str]:
+        roots = [str(tools_workspace.resolve())]
+        if context.notebook_dir is not None:
+            roots.append(str(context.notebook_dir.resolve()))
+        return roots
 
     def _build_environment(self, tools_root: Path) -> dict[str, str]:
         environment = os.environ.copy()
@@ -230,7 +257,7 @@ class CodexSdkAgent(AgentSupport):
             thread_config = {
                 "sandbox_workspace_write": {
                     "network_access": self.network_access,
-                    "writable_roots": [str(tools_workspace.resolve())],
+                    "writable_roots": self._writable_roots(context, tools_workspace),
                 }
             }
             with Codex(config) as codex:
@@ -323,7 +350,7 @@ class CodexSdkAgent(AgentSupport):
             thread_config = {
                 "sandbox_workspace_write": {
                     "network_access": self.network_access,
-                    "writable_roots": [str(tools_workspace.resolve())],
+                    "writable_roots": self._writable_roots(context, tools_workspace),
                 }
             }
             with Codex(config) as codex:
@@ -449,6 +476,10 @@ class ClaudeCliAgent(AgentSupport):
         context: AgentContext,
         tools_workspace: Path,
     ) -> list[str]:
+        additional_directories = (
+            ["--add-dir", str(context.notebook_dir.resolve())]
+            if context.notebook_dir is not None else []
+        )
         return [
             executable,
             "--print",
@@ -459,6 +490,7 @@ class ClaudeCliAgent(AgentSupport):
             self.permission_mode,
             "--add-dir",
             str(tools_workspace),
+            *additional_directories,
             "--allowedTools",
             "Read",
             "Write",

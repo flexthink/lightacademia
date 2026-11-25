@@ -76,7 +76,7 @@ class ChatModeTest(unittest.TestCase):
         settings = app.get_by_key("robot_settings")
         self.assertEqual(len(settings.radio), 0)
         self.assertEqual(settings.selectbox[0].value, "gpt-reserve")
-        self.assertEqual(len(app.button), 0)
+        self.assertEqual(app.button(key="new_robot_chat_Note.md").label, "New chat")
 
     def test_lightning_selector_contains_note_actions(self) -> None:
         app = self.panel(actions=True)
@@ -86,7 +86,7 @@ class ChatModeTest(unittest.TestCase):
         self.assertTrue(actions.button[0].disabled)
         actions.selectbox[0].select_index(1).run()
         self.assert_chat(app)
-        self.assertFalse(app.button[0].disabled)
+        self.assertFalse(app.button(key="run_chat_action_Note.md_0").disabled)
         self.assertIn("Summarize", app.chat_input[0].proto.placeholder)
 
     def test_chat_submission_uses_settings_and_preserves_them_after_run(self) -> None:
@@ -102,13 +102,28 @@ class ChatModeTest(unittest.TestCase):
         self.assertEqual(app.selectbox(key="agent_model_codex").value, "other-model")
         self.assertEqual(app.chat_message[0].markdown[0].value, "Hello Robot")
 
+    def test_new_chat_clears_transcript_and_backend_thread(self) -> None:
+        app = self.panel()
+        chat_key = "/test-project::Note.md"
+        app.session_state.agent_chats[chat_key] = {
+            "messages": [{"role": "user", "content": "Previous message"}],
+            "details": {"thread_id": "previous-thread"},
+        }
+        app.run()
+        app.button(key="new_robot_chat_Note.md").click().run()
+        self.assertEqual(list(app.exception), [])
+        self.assertEqual(len(app.chat_message), 0)
+        app.chat_input[0].set_value("Fresh message").run()
+        self.assertEqual(app.session_state.request["chat_details"], {})
+        self.assertEqual(app.session_state.request["prompt"], "Fresh message")
+
     def test_main_view_action_opens_lightning_selector_and_runs_in_chat(self) -> None:
         app = self.panel(actions=True)
         app.session_state.request_action = True
         self.assert_chat(app.run())
         self.assertTrue(app.session_state["robot_actions_Note.md_0"])
         self.assertEqual(app.selectbox(key="selected_action_Note.md_0").value.name, "Summarize")
-        app.button[0].click().run()
+        app.button(key="run_chat_action_Note.md_0").click().run()
         self.assertEqual(list(app.exception), [])
         self.assertEqual(app.session_state.request["mode"], "chat")
         self.assertIn("Summarize this note.", app.session_state.request["prompt"])

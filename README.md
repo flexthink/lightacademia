@@ -19,7 +19,58 @@ This tool is expected to be run locally in environments with no access to highly
 It is the user's responsibility to ensure that their agent set-up is adequately sandboxed. The developers of the tool are not responsible for any unwanted or undesirable behaviour of the tool or of the AI agent.
 
 
-## Run
+## Desktop application
+
+Install from this checkout and start the native desktop window:
+
+```bash
+python -m pip install -e .
+lightacademia
+```
+
+You can also run `python -m lightacademia` after installing `requirements.txt`.
+The existing `./lightacademia.sh` launcher also opens the desktop window and
+uses this checkout's `notebook/` and `tools/` folders.
+The editable install keeps the CLI connected to this checkout, which contains
+its Streamlit entry point, themes, prompts, and starter notebook.
+
+The window is named **Light Academia** and uses `assets/logo.png` as its native
+application icon. The launcher starts a localhost-only Streamlit server on an
+automatically selected port and stops it when the window closes. Server output
+stays in the terminal; `--debug` enables webview developer tools.
+
+```bash
+lightacademia --notebook ./my-notebook --tools ./my-tools --agent claude
+lightacademia --agent codex --codex-model gpt-5-codex
+lightacademia --help
+```
+
+Desktop launches default to `~/Light Academia/notebook` and
+`~/Light Academia/tools`, so data stays outside the application bundle. To use
+an existing checkout notebook, pass `--notebook ./notebook --tools ./tools`.
+Relative paths are resolved from the directory where you invoke the CLI.
+The existing `--autocommit-seconds` and `--agent-timeout-seconds` options are
+also supported.
+
+To build a standalone application, run this on the target operating system:
+
+```bash
+python -m pip install -r requirements.txt pyinstaller pillow
+# Optional: install requirements-codex.txt before building for Codex support.
+python -m PyInstaller --clean --noconfirm 'Light Academia.spec'
+```
+
+On macOS, open `dist/Light Academia.app`. Its bundle name, Dock identity, and
+icon are Light Academia's, rather than Python's. On Windows and Linux, the
+application is in `dist/Light Academia/`. Builds are platform-specific. Linux
+requires a supported GTK or Qt webview backend; Windows requires WebView2.
+See the [pywebview installation guide](https://pywebview.flowrl.com/guide/installation.html)
+for native dependencies. The bundle still uses your installed agent tools and
+credentials. Notebook scripts use an installed Python interpreter; set
+`LIGHTACADEMIA_PYTHON` to its absolute path to select a virtual environment
+with your research dependencies. Signing and notarization are separate distribution steps.
+
+## Run in a browser
 
 ```bash
 python -m pip install -r requirements.txt
@@ -52,6 +103,25 @@ python -m streamlit run app.py -- --tools ./my-tools
 The tools folder can contain `SKILL.md` describing available researcher-specific commands, such as cluster, cloud, or wandb helpers.
 
 Each project can also contain its own `SKILL.md` for project-specific guidance on how to use those tools.
+
+## Daily Notes
+
+Use **Today** in the sidebar to create or open today's daily note. Each note
+is titled with its ISO date (`YYYY-MM-DD`); repeated clicks reopen the same note
+and preserve its contents. Dates use the local timezone of the app server.
+
+Daily notes live in the hidden `.daily-notes/` workspace inside the configured
+notebook folder, separate from regular projects. They use the normal note editor,
+history, and automatic checkpoints. Search includes daily notes alongside the
+current project's notes; within Daily Notes, search covers all daily entries.
+
+The robot in Daily Notes can read and update any project under the configured
+notebook folder without switching projects. Its default output remains the
+selected daily note. Robots in regular projects remain scoped to their project.
+
+The **Calendar** button opens a monthly calendar. Days with notes are marked
+with a dot and can be clicked to open that day's note. Use Previous and Next
+to browse months.
 
 ## Note actions
 

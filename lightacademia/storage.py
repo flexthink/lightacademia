@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import yaml
@@ -11,7 +11,8 @@ import yaml
 from .git_ops import git_commit_all, git_init, git_mv
 
 
-RESERVED_PROJECT_NAMES = {"archived"}
+DAILY_NOTES_PROJECT = ".daily-notes"
+RESERVED_PROJECT_NAMES = {"archived", DAILY_NOTES_PROJECT}
 HOME_NOTE = "Home.md"
 PROJECT_SKILL = "SKILL.md"
 PROJECT_DIRECTORIES = ("chats", "archived", "data", "assets", "code")
@@ -211,3 +212,38 @@ def archive_note(project: Project, note: Note) -> Path:
     target = unique_child_path(archived_dir, note.path.stem, note.path.suffix)
     git_mv(project.path, note.path, target)
     return target
+
+
+def daily_notes_project(notebook_dir: Path) -> Project:
+    """Return the private daily-note workspace without creating ordinary notes."""
+    path = notebook_dir / DAILY_NOTES_PROJECT
+    path.mkdir(parents=True, exist_ok=True)
+    project = Project(DAILY_NOTES_PROJECT, path)
+    ensure_project_directories(project)
+    if not (path / ".git").exists():
+        git_init(path)
+    return project
+
+
+def get_or_create_daily_note(project: Project, day: date) -> Note:
+    """Create exactly one note per local calendar date, preserving existing text."""
+    title = day.isoformat()
+    path = project.path / f"{title}.md"
+    try:
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(f"# {title}\n\n")
+    except FileExistsError:
+        pass
+    return Note(path.name, path)
+
+
+def daily_notes_by_date(project: Project) -> dict[date, Note]:
+    result = {}
+    for note in list_notes(project):
+        try:
+            day = date.fromisoformat(note.path.stem)
+        except ValueError:
+            continue
+        if day.isoformat() == note.path.stem:
+            result[day] = note
+    return result

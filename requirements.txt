@@ -6,3 +6,5 @@ streamlit-extras
 bm25s
 pandas
 tabulate
+
+pywebview>=6,<7

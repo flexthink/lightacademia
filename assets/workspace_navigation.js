@@ -39,7 +39,7 @@ function sameRoute(left, right) {
 }
 
 export default function(component) {
-  const { data, parentElement, setStateValue } = component;
+  const { data, parentElement, setTriggerValue } = component;
   const root = parentElement.querySelector(".la-workspace-navigation");
   if (!root || !data) {
     return;
@@ -53,8 +53,8 @@ export default function(component) {
   const pushRoute = data.pushRoute || null;
 
   const reportRoute = (route) => {
-    if (route && !sameRoute(route, current)) {
-      setStateValue("route", {
+    if (route && !sameRoute(route, pushRoute?.project ? pushRoute : current)) {
+      setTriggerValue("route_requested", {
         project: route.project,
         note: route.note || "",
       });
@@ -74,27 +74,45 @@ export default function(component) {
   };
 
   if (data.mode === "projects") {
+    // Component renders can precede Python's acknowledgement of navigation.
+    // Reading the hash as a new event on every render creates a feedback loop.
+    const navigation = parentWindow.__laWorkspaceNavigation || {
+      initialized: false,
+      observedHash: null,
+    };
+    parentWindow.__laWorkspaceNavigation = navigation;
+    const observeHash = () => {
+      const hash = parentWindow.location.hash;
+      if (hash === navigation.observedHash) {
+        return;
+      }
+      navigation.observedHash = hash;
+      reportRoute(decodeRoute(hash));
+    };
+
     if (pushRoute && pushRoute.project) {
-      setHash(pushRoute);
-    } else {
-      const hashRoute = decodeRoute(parentWindow.location.hash);
-      if (hashRoute) {
-        reportRoute(hashRoute);
+      // Python has already selected this route. Updating the URL must not
+      // generate another navigation request, including from an old listener.
+      const hash = encodeRoute(pushRoute.project, pushRoute.note);
+      if (parentWindow.location.hash !== hash) {
+        parentWindow.history.pushState(null, "", hash);
+      }
+      navigation.observedHash = hash;
+    } else if (!navigation.initialized) {
+      if (decodeRoute(parentWindow.location.hash)) {
+        observeHash();
       } else if (current.project) {
         setHash(current, true);
+        navigation.observedHash = parentWindow.location.hash;
       }
     }
+    navigation.initialized = true;
 
     if (parentWindow.__laWorkspaceHashHandler) {
       parentWindow.removeEventListener("hashchange", parentWindow.__laWorkspaceHashHandler);
     }
-    parentWindow.__laWorkspaceHashHandler = () => {
-      const route = decodeRoute(parentWindow.location.hash);
-      if (route) {
-        reportRoute(route);
-      }
-    };
-    parentWindow.addEventListener("hashchange", parentWindow.__laWorkspaceHashHandler);
+    parentWindow.__laWorkspaceHashHandler = observeHash;
+    parentWindow.addEventListener("hashchange", observeHash);
   }
 
   root.replaceChildren();
@@ -106,6 +124,13 @@ export default function(component) {
     const select = document.createElement("select");
     select.className = "la-workspace-project-select";
     select.setAttribute("aria-label", "Projects");
+    if (current.project === ".daily-notes") {
+      const option = document.createElement("option");
+      option.textContent = "Daily Notes";
+      option.selected = true;
+      option.disabled = true;
+      select.appendChild(option);
+    }
     for (const project of data.projects || []) {
       const option = document.createElement("option");
       option.value = project.name;
